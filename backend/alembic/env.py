@@ -2,7 +2,7 @@ import sys
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, engine_from_config, pool
 from alembic import context
 
 # Ensure backend directory is in sys.path
@@ -27,7 +27,17 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 # Inject database URL from Pydantic settings dynamically
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# ConfigParser interprets '%' as variable interpolation, so escape '%' to '%%'
+database_url_str = (
+    settings.get_database_url_str(hide_password=False)
+    if hasattr(settings, "get_database_url_str")
+    else (
+        settings.DATABASE_URL.render_as_string(hide_password=False)
+        if hasattr(settings.DATABASE_URL, "render_as_string")
+        else str(settings.DATABASE_URL)
+    )
+)
+config.set_main_option("sqlalchemy.url", database_url_str.replace("%", "%%"))
 
 
 def run_migrations_offline() -> None:
@@ -61,9 +71,8 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    connectable = create_engine(
+        settings.DATABASE_URL,
         poolclass=pool.NullPool,
     )
 

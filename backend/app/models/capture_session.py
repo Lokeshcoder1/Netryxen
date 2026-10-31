@@ -1,13 +1,16 @@
 import enum
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, Enum, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.flow_record import FlowRecord
 
 
 class SessionMode(str, enum.Enum):
@@ -77,6 +80,13 @@ class CaptureSession(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    )
+
+    # Relationships
+    flows: Mapped[List["FlowRecord"]] = relationship(
+        "FlowRecord",
+        back_populates="session",
+        cascade="all, delete-orphan",
     )
 
     __table_args__ = (

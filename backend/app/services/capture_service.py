@@ -62,6 +62,7 @@ class CaptureService:
                 session_id=session_id,
                 session_mode=req.session_mode,
                 bpf_filter=req.bpf_filter,
+                local_ips=iface.ip_addresses,
             )
         except Exception as exc:
             db_session.status = CaptureStatus.FAILED.value

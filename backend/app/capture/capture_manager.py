@@ -60,6 +60,7 @@ class CaptureManager:
         session_id: uuid.UUID,
         session_mode: SessionMode = SessionMode.MONITORING,
         bpf_filter: Optional[str] = None,
+        local_ips: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Starts live packet capture on the validated interface.
@@ -91,6 +92,14 @@ class CaptureManager:
                 logger.error(f"Failed to start Scapy AsyncSniffer on {interface_id}: {exc}")
                 raise RuntimeError(self._error_summary) from exc
 
+            # Start flow aggregator for this session
+            from app.capture.flow_aggregator import flow_aggregator
+            flow_aggregator.start(
+                session_id=session_id,
+                packet_queue=self.packet_queue,
+                local_ips=local_ips or iface.ip_addresses,
+            )
+
             self._is_running = True
             self._active_session_id = session_id
             self._interface_id = iface.id
@@ -116,8 +125,13 @@ class CaptureManager:
                 logger.warning(f"Error while stopping AsyncSniffer: {exc}")
                 self._error_summary = f"Stop error: {str(exc)}"
 
+            # Stop and flush flow aggregator
+            from app.capture.flow_aggregator import flow_aggregator
+            flows_persisted = flow_aggregator.stop_and_flush()
+
             stopped_session_id = self._active_session_id
             stats = self.packet_queue.get_stats()
+            stats["flows_persisted"] = flows_persisted
             self._is_running = False
             self._sniffer = None
             self._active_session_id = None
@@ -140,6 +154,9 @@ class CaptureManager:
 
     def _get_status_unlocked(self) -> Dict[str, Any]:
         stats = self.packet_queue.get_stats()
+        from app.capture.flow_aggregator import flow_aggregator
+        agg_stats = flow_aggregator.get_stats()
+
         return {
             "is_running": self._is_running,
             "active_session_id": self._active_session_id,
@@ -152,6 +169,8 @@ class CaptureManager:
             "queue_size": stats["queue_size"],
             "queue_capacity": stats["queue_capacity"],
             "preview_count": stats["preview_count"],
+            "active_flows": agg_stats["active_windows_count"],
+            "flows_persisted": agg_stats["total_flows_persisted"],
             "error_summary": self._error_summary,
         }
 

@@ -41,6 +41,8 @@ class CaptureStatusResponse(BaseModel):
     queue_size: int = Field(0, description="Current number of packets pending in queue")
     queue_capacity: int = Field(..., description="Configured maximum queue capacity")
     preview_count: int = Field(0, description="Current number of diagnostic preview packets buffered")
+    active_flows: Optional[int] = Field(None, description="Current count of active in-memory flows")
+    flows_persisted: Optional[int] = Field(None, description="Total flow records persisted for active session")
     error_summary: Optional[str] = Field(None, description="Last recorded error if any")
 
 
