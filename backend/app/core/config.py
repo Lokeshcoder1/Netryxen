@@ -1,7 +1,10 @@
 from typing import Optional, Union
+from pathlib import Path
 from pydantic import computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL, make_url
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 class Settings(BaseSettings):
@@ -53,8 +56,19 @@ class Settings(BaseSettings):
     FLOW_AGGREGATOR_INTERVAL_SECONDS: float = 1.0
     FLOW_MEMORY_CAPACITY: int = 50000
 
+    # ML / Detection Configuration
+    MODEL_ARTIFACTS_DIR: str = "models"
+    ML_MIN_BASELINE_SAMPLES: int = 50
+    ML_CONTAMINATION: float = 0.05
+    ML_N_ESTIMATORS: int = 100
+    ML_RANDOM_STATE: int = 42
+
+    # Alert Configuration
+    ALERT_COOLDOWN_SECONDS: int = 300
+    ALERT_SEVERITY_THRESHOLDS: str = "LOW=-0.3,MEDIUM=-0.5,HIGH=-0.7,CRITICAL=-0.9"
+
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=True,

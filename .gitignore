@@ -43,3 +43,7 @@ htmlcov/
 
 # Logs
 *.log
+
+# Model artifacts
+backend/models/*.joblib
+!backend/models/.gitkeep

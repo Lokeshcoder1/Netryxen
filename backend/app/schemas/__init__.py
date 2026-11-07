@@ -7,6 +7,15 @@ from app.schemas.capture import (
     InterfaceInfo,
 )
 from app.schemas.dashboard import DashboardSummaryResponse, TopTalkerItem
+from app.schemas.detection import (
+    AlertListResponse,
+    AlertResponse,
+    ModelRegistryResponse,
+    ModelStatusResponse,
+    PredictionListResponse,
+    PredictionResponse,
+    TrainBaselineRequest,
+)
 from app.schemas.error import ErrorDetail, ErrorResponse
 from app.schemas.flow import (
     FlowFilterParams,
@@ -33,4 +42,11 @@ __all__ = [
     "ReadinessResponse",
     "ErrorDetail",
     "ErrorResponse",
+    "TrainBaselineRequest",
+    "ModelRegistryResponse",
+    "ModelStatusResponse",
+    "PredictionResponse",
+    "PredictionListResponse",
+    "AlertResponse",
+    "AlertListResponse",
 ]
