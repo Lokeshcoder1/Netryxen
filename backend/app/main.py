@@ -20,9 +20,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     Schema migrations are managed explicitly via Alembic.
     """
     logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION}")
+    from app.services.detection_worker import detection_worker
+    if settings.DETECTION_WORKER_ENABLED:
+        logger.info("Starting background DetectionWorker...")
+        detection_worker.start()
     yield
     # Shutdown logic
     logger.info("Application shutting down...")
+    if detection_worker.is_running:
+        logger.info("Stopping background DetectionWorker on shutdown...")
+        try:
+            detection_worker.stop()
+        except Exception as exc:
+            logger.warning(f"Error during shutdown detection worker termination: {exc}")
     if capture_manager.is_running:
         logger.info("Stopping active capture engine on shutdown...")
         try:
@@ -42,10 +52,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware for local prototype development
+# CORS middleware for local prototype development and frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

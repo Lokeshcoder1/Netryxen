@@ -38,21 +38,24 @@ FEATURE_NAMES: List[str] = [
 def extract_features_from_dict(features_dict: Dict[str, Any]) -> List[float]:
     """
     Extracts an ordered numeric vector from a flow's features dictionary or model attributes.
-    Missing or None numerical values are imputed with 0.0 (or 0.5 for upload_ratio).
+    Missing or non-finite numerical values (None, NaN, +Inf, -Inf) are returned as np.nan
+    so the scikit-learn SimpleImputer in the pipeline handles them statistically
+    rather than relying on arbitrary defaults.
     """
     vector: List[float] = []
     for name in FEATURE_NAMES:
         val = features_dict.get(name)
         if val is None:
-            if name == "upload_ratio":
-                vector.append(0.5)
-            else:
-                vector.append(0.0)
+            vector.append(float("nan"))
         else:
             try:
-                vector.append(float(val))
+                num = float(val)
+                if np.isnan(num) or np.isinf(num):
+                    vector.append(float("nan"))
+                else:
+                    vector.append(num)
             except (ValueError, TypeError):
-                vector.append(0.0)
+                vector.append(float("nan"))
     return vector
 
 
@@ -61,27 +64,27 @@ def extract_features_from_flow(flow: Any) -> List[float]:
     Extracts ordered feature vector directly from a FlowRecord model instance.
     """
     data = {
-        "duration_seconds": getattr(flow, "duration_seconds", 0.0),
-        "packet_count": getattr(flow, "packet_count", 0),
-        "byte_count": getattr(flow, "byte_count", 0),
-        "fwd_packets": getattr(flow, "fwd_packets", 0),
-        "rev_packets": getattr(flow, "rev_packets", 0),
-        "fwd_bytes": getattr(flow, "fwd_bytes", 0),
-        "rev_bytes": getattr(flow, "rev_bytes", 0),
-        "packets_per_second": getattr(flow, "packets_per_second", 0.0),
-        "bytes_per_second": getattr(flow, "bytes_per_second", 0.0),
-        "min_packet_size": getattr(flow, "min_packet_size", 0),
-        "max_packet_size": getattr(flow, "max_packet_size", 0),
-        "avg_packet_size": getattr(flow, "avg_packet_size", 0.0),
-        "tcp_syn_count": getattr(flow, "tcp_syn_count", 0),
-        "tcp_ack_count": getattr(flow, "tcp_ack_count", 0),
-        "tcp_fin_count": getattr(flow, "tcp_fin_count", 0),
-        "tcp_rst_count": getattr(flow, "tcp_rst_count", 0),
-        "tcp_psh_count": getattr(flow, "tcp_psh_count", 0),
-        "dns_query_count": getattr(flow, "dns_query_count", 0),
-        "dns_unique_query_count": getattr(flow, "dns_unique_query_count", 0),
-        "upload_bytes": getattr(flow, "upload_bytes", 0),
-        "download_bytes": getattr(flow, "download_bytes", 0),
+        "duration_seconds": getattr(flow, "duration_seconds", None),
+        "packet_count": getattr(flow, "packet_count", None),
+        "byte_count": getattr(flow, "byte_count", None),
+        "fwd_packets": getattr(flow, "fwd_packets", None),
+        "rev_packets": getattr(flow, "rev_packets", None),
+        "fwd_bytes": getattr(flow, "fwd_bytes", None),
+        "rev_bytes": getattr(flow, "rev_bytes", None),
+        "packets_per_second": getattr(flow, "packets_per_second", None),
+        "bytes_per_second": getattr(flow, "bytes_per_second", None),
+        "min_packet_size": getattr(flow, "min_packet_size", None),
+        "max_packet_size": getattr(flow, "max_packet_size", None),
+        "avg_packet_size": getattr(flow, "avg_packet_size", None),
+        "tcp_syn_count": getattr(flow, "tcp_syn_count", None),
+        "tcp_ack_count": getattr(flow, "tcp_ack_count", None),
+        "tcp_fin_count": getattr(flow, "tcp_fin_count", None),
+        "tcp_rst_count": getattr(flow, "tcp_rst_count", None),
+        "tcp_psh_count": getattr(flow, "tcp_psh_count", None),
+        "dns_query_count": getattr(flow, "dns_query_count", None),
+        "dns_unique_query_count": getattr(flow, "dns_unique_query_count", None),
+        "upload_bytes": getattr(flow, "upload_bytes", None),
+        "download_bytes": getattr(flow, "download_bytes", None),
         "upload_ratio": getattr(flow, "upload_ratio", None),
     }
     return extract_features_from_dict(data)

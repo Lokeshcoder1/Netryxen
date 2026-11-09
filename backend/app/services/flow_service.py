@@ -41,6 +41,19 @@ class FlowService:
         stats = FlowRepository.get_dashboard_stats(db=db)
         capture_status = capture_manager.get_status()
 
+        from app.services.detection_worker import detection_worker
+        worker_stats = detection_worker.get_stats()
+        db_job_stats = stats.get("detection_jobs", {})
+
+        worker_summary = {
+            "is_running": worker_stats.get("is_running", False),
+            "pending_jobs": db_job_stats.get("pending_jobs", 0),
+            "processing_jobs": db_job_stats.get("processing_jobs", 0),
+            "completed_jobs": db_job_stats.get("completed_jobs", 0),
+            "failed_jobs": db_job_stats.get("failed_jobs", 0),
+            "total_processed": db_job_stats.get("total_processed", 0),
+        }
+
         return DashboardSummaryResponse(
             capture_status=capture_status,
             total_sessions=stats["total_sessions"],
@@ -52,4 +65,6 @@ class FlowService:
             recent_flows=[
                 FlowRecordResponse.model_validate(f) for f in stats["recent_flows"]
             ],
+            alert_summary=stats.get("alert_summary", {}),
+            detection_worker=worker_summary,
         )

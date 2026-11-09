@@ -63,9 +63,46 @@ class Settings(BaseSettings):
     ML_N_ESTIMATORS: int = 100
     ML_RANDOM_STATE: int = 42
 
+    def get_model_artifacts_path(self) -> Path:
+        p = Path(self.MODEL_ARTIFACTS_DIR)
+        if not p.is_absolute():
+            return PROJECT_ROOT / "backend" / p
+        return p
+
     # Alert Configuration
     ALERT_COOLDOWN_SECONDS: int = 300
     ALERT_SEVERITY_THRESHOLDS: str = "LOW=-0.3,MEDIUM=-0.5,HIGH=-0.7,CRITICAL=-0.9"
+
+    # Behavioral Rule Thresholds
+    RULE_SYN_RATIO_THRESHOLD: float = 5.0
+    RULE_SYN_MIN_PACKETS: int = 10
+    RULE_HIGH_PPS_THRESHOLD: float = 500.0
+    RULE_HIGH_BPS_THRESHOLD: float = 5_000_000.0
+    RULE_HIGH_RST_THRESHOLD: int = 5
+    RULE_HIGH_DNS_THRESHOLD: int = 25
+    RULE_PORT_SCAN_DISTINCT_PORTS: int = 10
+    RULE_PORT_SCAN_WINDOW_SECONDS: int = 60
+    RULE_BEACON_MIN_INTERVALS: int = 4
+    RULE_BEACON_MAX_PACKETS_PER_FLOW: int = 10
+    RULE_BEACON_MAX_JITTER_SECONDS: float = 3.0
+    RULE_BEACON_MAX_CV: float = 0.25
+
+    # Background Detection Worker Configuration
+    DETECTION_WORKER_ENABLED: bool = True
+    DETECTION_WORKER_INTERVAL_SECONDS: float = 1.0
+    DETECTION_WORKER_BATCH_SIZE: int = 50
+    DETECTION_WORKER_MAX_RETRIES: int = 3
+    DETECTION_JOB_STUCK_TIMEOUT_SECONDS: int = 300
+
+    # CORS Configuration
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ]
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

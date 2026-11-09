@@ -179,32 +179,35 @@ class PacketParser:
                 protocol_name = f"IP-Proto-{protocol_num}" if protocol_num is not None else "Unknown"
 
             # DNS Query counting (metadata count only, NO query domain name storage)
+            # Only count actual DNS queries (qr == 0), ignore DNS responses (qr == 1)
             dns_query_count = 0
             dns_unique_query_count = 0
             if DNS in pkt:
                 dns_layer = pkt[DNS]
-                qdcount = getattr(dns_layer, "qdcount", 0) or 0
-                qd = getattr(dns_layer, "qd", None)
-                if qd is not None:
-                    queries: List[str] = []
-                    # In Scapy, qd can be a PacketListField or a single Packet
-                    try:
-                        if isinstance(qd, (list, tuple)):
-                            for q in qd:
-                                qname = getattr(q, "qname", b"")
-                                queries.append(str(qname))
-                        elif hasattr(qd, "qname"):
-                            queries.append(str(getattr(qd, "qname", b"")))
-                        elif hasattr(qd, "__iter__"):
-                            for q in qd:
-                                queries.append(str(getattr(q, "qname", b"")))
-                    except Exception:
-                        pass
-                    dns_query_count = len(queries) if queries else int(qdcount)
-                    dns_unique_query_count = len(set(queries)) if queries else int(qdcount)
-                else:
-                    dns_query_count = int(qdcount)
-                    dns_unique_query_count = int(qdcount)
+                is_query = (getattr(dns_layer, "qr", 0) == 0)
+                if is_query:
+                    qdcount = getattr(dns_layer, "qdcount", 0) or 0
+                    qd = getattr(dns_layer, "qd", None)
+                    if qd is not None:
+                        queries: List[str] = []
+                        # In Scapy, qd can be a PacketListField or a single Packet
+                        try:
+                            if isinstance(qd, (list, tuple)):
+                                for q in qd:
+                                    qname = getattr(q, "qname", b"")
+                                    queries.append(str(qname))
+                            elif hasattr(qd, "qname"):
+                                queries.append(str(getattr(qd, "qname", b"")))
+                            elif hasattr(qd, "__iter__"):
+                                for q in qd:
+                                    queries.append(str(getattr(q, "qname", b"")))
+                        except Exception:
+                            pass
+                        dns_query_count = len(queries) if queries else int(qdcount)
+                        dns_unique_query_count = len(set(queries)) if queries else int(qdcount)
+                    else:
+                        dns_query_count = int(qdcount)
+                        dns_unique_query_count = int(qdcount)
 
             is_local = cls._is_local_ip(src_ip) or cls._is_local_ip(dst_ip)
             is_bcast = cls._is_broadcast_ip(dst_ip)
@@ -215,6 +218,11 @@ class PacketParser:
                     is_bcast = True
 
             is_mcast = cls._is_multicast_ip(dst_ip)
+            if not is_mcast and Ether in pkt:
+                eth = pkt[Ether]
+                dst_mac = (getattr(eth, "dst", "") or "").lower()
+                if dst_mac.startswith("01:00:5e") or dst_mac.startswith("33:33"):
+                    is_mcast = True
 
             return PacketEventSchema(
                 timestamp=ts,

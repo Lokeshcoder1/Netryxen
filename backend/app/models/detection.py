@@ -61,6 +61,13 @@ class AlertStatus(str, enum.Enum):
     RESOLVED = "RESOLVED"
 
 
+class DetectionJobStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 # ---------------------------------------------------------------------------
 # ModelRegistry
 # ---------------------------------------------------------------------------
@@ -258,4 +265,62 @@ class Alert(Base):
         return (
             f"<Alert(id={self.id}, severity='{self.severity}', "
             f"source='{self.detection_source}', status='{self.status}')>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# DetectionJob (Transactional Outbox)
+# ---------------------------------------------------------------------------
+
+class DetectionJob(Base):
+    """
+    Transactional outbox job queue for automatic asynchronous detection processing of flow records.
+    """
+    __tablename__ = "detection_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    flow_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("flow_records.id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=DetectionJobStatus.PENDING.value, index=True,
+    )
+    retry_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+    )
+    max_retries: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3,
+    )
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    error_message: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_detection_jobs_status_scheduled", "status", "scheduled_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<DetectionJob(id={self.id}, flow={self.flow_id}, "
+            f"status='{self.status}', retries={self.retry_count})>"
         )

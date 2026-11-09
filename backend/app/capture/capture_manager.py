@@ -87,18 +87,26 @@ class CaptureManager:
                     filter=bpf_filter,
                 )
                 self._sniffer.start()
-            except Exception as exc:
-                self._error_summary = f"Capture startup failed: {str(exc)}"
-                logger.error(f"Failed to start Scapy AsyncSniffer on {interface_id}: {exc}")
-                raise RuntimeError(self._error_summary) from exc
 
-            # Start flow aggregator for this session
-            from app.capture.flow_aggregator import flow_aggregator
-            flow_aggregator.start(
-                session_id=session_id,
-                packet_queue=self.packet_queue,
-                local_ips=local_ips or iface.ip_addresses,
-            )
+                # Start flow aggregator for this session
+                from app.capture.flow_aggregator import flow_aggregator
+                flow_aggregator.start(
+                    session_id=session_id,
+                    packet_queue=self.packet_queue,
+                    local_ips=local_ips or iface.ip_addresses,
+                )
+            except Exception as exc:
+                if self._sniffer:
+                    try:
+                        self._sniffer.stop()
+                    except Exception:
+                        pass
+                    self._sniffer = None
+                self._is_running = False
+                self._active_session_id = None
+                self._error_summary = f"Capture startup failed: {str(exc)}"
+                logger.error(f"Failed to start capture on {interface_id}: {exc}")
+                raise RuntimeError(self._error_summary) from exc
 
             self._is_running = True
             self._active_session_id = session_id
