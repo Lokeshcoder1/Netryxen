@@ -3,6 +3,8 @@ from app.models.detection import (
     Alert,
     AlertSeverity,
     AlertStatus,
+    DetectionJob,
+    DetectionJobStatus,
     DetectionSource,
     ModelRegistry,
     ModelStatus,
@@ -24,4 +26,6 @@ __all__ = [
     "AlertSeverity",
     "AlertStatus",
     "DetectionSource",
+    "DetectionJob",
+    "DetectionJobStatus",
 ]

@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 import threading
 import time
@@ -290,6 +290,9 @@ class FlowAggregator:
 
         # In-memory accumulators: key is (canonical_flow_key, window_start)
         self._accumulators: Dict[Tuple[str, datetime], FlowAccumulator] = {}
+        # Bounded cache of recently finalized window keys to drop late arriving packets and prevent duplicate DB records
+        self._finalized_windows: OrderedDict[Tuple[str, datetime], None] = OrderedDict()
+        self._max_finalized_history: int = 50000
         self._lock = threading.Lock()
 
         # Lifecycle control
@@ -299,6 +302,7 @@ class FlowAggregator:
         # Metrics & observability
         self._total_flows_persisted: int = 0
         self._aggregation_errors: int = 0
+        self._late_packets_dropped: int = 0
 
     @property
     def is_running(self) -> bool:
@@ -328,8 +332,10 @@ class FlowAggregator:
             self._packet_queue = packet_queue
             self._local_ips = set(local_ips or [])
             self._accumulators.clear()
+            self._finalized_windows.clear()
             self._total_flows_persisted = 0
             self._aggregation_errors = 0
+            self._late_packets_dropped = 0
             self._is_running = True
 
             self._worker_thread = threading.Thread(
@@ -391,6 +397,12 @@ class FlowAggregator:
 
         acc_key = (flow_key, window_start)
 
+        # Late packet policy: If the window for this packet was already finalized and persisted to DB,
+        # drop it rather than resurrecting a duplicate flow record for the same window.
+        if acc_key in self._finalized_windows:
+            self._late_packets_dropped += 1
+            return
+
         # Check bounds before adding new flows
         if acc_key not in self._accumulators and len(self._accumulators) >= self.max_in_memory_flows:
             logger.warning("FlowAggregator in-memory capacity reached. Forcing early finalization of oldest windows.")
@@ -420,7 +432,11 @@ class FlowAggregator:
             pkt = self._packet_queue.pop(timeout=0.01)
             if pkt is None:
                 break
-            self._process_packet(pkt)
+            try:
+                self._process_packet(pkt)
+            except Exception as exc:
+                self._aggregation_errors += 1
+                logger.debug(f"Error processing drained packet: {exc}")
             count += 1
 
         if count > 0:
@@ -441,7 +457,7 @@ class FlowAggregator:
         elif force_oldest:
             # Sort windows by start time and finalize the oldest half
             sorted_keys = sorted(self._accumulators.keys(), key=lambda k: k[1])
-            keys_to_finalize = sorted_keys[: len(sorted_keys) // 2]
+            keys_to_finalize = sorted_keys[: max(1, len(sorted_keys) // 2)]
         else:
             for (key, w_start), acc in self._accumulators.items():
                 if acc.window_end + grace_period <= now:
@@ -455,6 +471,9 @@ class FlowAggregator:
             acc = self._accumulators.pop(k, None)
             if acc:
                 records.append(acc.to_flow_record())
+                self._finalized_windows[k] = None
+                if len(self._finalized_windows) > self._max_finalized_history:
+                    self._finalized_windows.popitem(last=False)
 
         if not records:
             return 0
@@ -479,7 +498,7 @@ class FlowAggregator:
 
     def _worker_loop(self) -> None:
         """
-        Continuous background aggregation loop.
+        Continuous background aggregation loop wrapped in robust error handling to prevent thread crash.
         """
         last_check_monotonic = time.monotonic()
 
@@ -488,20 +507,31 @@ class FlowAggregator:
                 if not self._is_running:
                     break
 
-            # Consume up to 500 packets in a quick burst
-            batch_count = 0
-            while batch_count < 500:
-                pkt = self._packet_queue.pop(timeout=0.1) if self._packet_queue else None
-                if pkt is None:
-                    break
-                self._process_packet(pkt)
-                batch_count += 1
+            try:
+                # Consume up to 500 packets in a quick burst
+                batch_count = 0
+                while batch_count < 500:
+                    pkt = self._packet_queue.pop(timeout=0.1) if self._packet_queue else None
+                    if pkt is None:
+                        break
+                    try:
+                        self._process_packet(pkt)
+                    except Exception as p_exc:
+                        with self._lock:
+                            self._aggregation_errors += 1
+                        logger.debug(f"Error processing packet in aggregator loop: {p_exc}")
+                    batch_count += 1
 
-            # Check for window expirations periodically
-            now_mono = time.monotonic()
-            if now_mono - last_check_monotonic >= self.worker_interval:
-                last_check_monotonic = now_mono
-                self._finalize_windows(force_all=False)
+                # Check for window expirations periodically
+                now_mono = time.monotonic()
+                if now_mono - last_check_monotonic >= self.worker_interval:
+                    last_check_monotonic = now_mono
+                    self._finalize_windows(force_all=False)
+            except Exception as loop_exc:
+                with self._lock:
+                    self._aggregation_errors += 1
+                logger.error(f"Unexpected error in FlowAggregator worker loop: {loop_exc}")
+                time.sleep(0.1)
 
     def get_stats(self) -> Dict[str, Any]:
         """
@@ -514,6 +544,7 @@ class FlowAggregator:
                 "active_windows_count": len(self._accumulators),
                 "total_flows_persisted": self._total_flows_persisted,
                 "aggregation_errors": self._aggregation_errors,
+                "late_packets_dropped": self._late_packets_dropped,
             }
 
 

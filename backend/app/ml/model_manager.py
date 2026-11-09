@@ -40,8 +40,7 @@ class ModelManager:
         if artifacts_dir:
             self.artifacts_dir = Path(artifacts_dir)
         else:
-            base_dir = getattr(settings, "PROJECT_ROOT", Path.cwd())
-            self.artifacts_dir = base_dir / "backend" / "models"
+            self.artifacts_dir = settings.get_model_artifacts_path()
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         self._active_model_id: Optional[uuid.UUID] = None
@@ -171,10 +170,20 @@ class ModelManager:
             ),
         }
 
-        # Serialize artifact
+        # Atomically serialize artifact via temp file
         artifact_filename = f"{model_name}_{v_str}_{uuid.uuid4().hex[:8]}.joblib"
         artifact_path = self.artifacts_dir / artifact_filename
-        joblib.dump(pipeline, artifact_path)
+        tmp_artifact_path = self.artifacts_dir / f"{artifact_filename}.tmp"
+        try:
+            joblib.dump(pipeline, tmp_artifact_path)
+            tmp_artifact_path.replace(artifact_path)
+        except Exception as exc:
+            if tmp_artifact_path.is_file():
+                try:
+                    tmp_artifact_path.unlink()
+                except Exception:
+                    pass
+            raise RuntimeError(f"Failed to serialize model artifact: {exc}") from exc
 
         checksum = self.compute_file_checksum(artifact_path)
         logger.info(
@@ -189,12 +198,7 @@ class ModelManager:
             "min_samples": required_samples,
         }
 
-        # Set as active loaded model
-        with self._lock:
-            self._active_model_id = model_id
-            self._active_model_version = v_str
-            self._active_pipeline = pipeline
-
+        # Do not activate in-memory model until DB persistence succeeds
         return {
             "id": model_id,
             "name": model_name,
@@ -209,7 +213,16 @@ class ModelManager:
             "artifact_path": str(artifact_path),
             "artifact_checksum": checksum,
             "evaluation_info": eval_info,
+            "_pipeline": pipeline,
         }
+
+    def activate_model(self, model_id: uuid.UUID, version: str, pipeline: Pipeline) -> None:
+        """Sets the active loaded model in memory."""
+        with self._lock:
+            self._active_model_id = model_id
+            self._active_model_version = version
+            self._active_pipeline = pipeline
+        logger.info(f"Activated model {model_id} (version '{version}') for live inference.")
 
     def load_artifact(
         self,

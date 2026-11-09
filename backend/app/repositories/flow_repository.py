@@ -15,13 +15,27 @@ class FlowRepository:
     """
 
     @staticmethod
-    def create_batch(db: Session, records: List[FlowRecord]) -> int:
+    def create_batch(db: Session, records: List[FlowRecord], create_jobs: bool = True) -> int:
         """
-        Inserts a batch of flow records efficiently.
+        Inserts a batch of flow records efficiently and atomically schedules detection jobs.
         """
         if not records:
             return 0
         db.add_all(records)
+        if create_jobs:
+            from datetime import datetime, timezone
+            from app.models.detection import DetectionJob, DetectionJobStatus
+            now = datetime.now(timezone.utc)
+            jobs = [
+                DetectionJob(
+                    id=uuid.uuid4(),
+                    flow_id=r.id,
+                    status=DetectionJobStatus.PENDING.value,
+                    scheduled_at=now,
+                )
+                for r in records
+            ]
+            db.add_all(jobs)
         db.commit()
         return len(records)
 
@@ -112,21 +126,46 @@ class FlowRepository:
         ).all()
         protocol_distribution = {row[0]: row[1] for row in proto_rows}
 
-        # Top talker source IPs by bytes
+        # Directional endpoint aggregation (initiator sent fwd_bytes, responder sent rev_bytes)
+        q_src = select(
+            FlowRecord.src_ip.label("ip"),
+            FlowRecord.fwd_packets.label("pkts_sent"),
+            FlowRecord.rev_packets.label("pkts_recv"),
+            FlowRecord.fwd_bytes.label("bytes_sent"),
+            FlowRecord.rev_bytes.label("bytes_recv"),
+        ).where(FlowRecord.src_ip.isnot(None))
+
+        q_dst = select(
+            FlowRecord.dst_ip.label("ip"),
+            FlowRecord.rev_packets.label("pkts_sent"),
+            FlowRecord.fwd_packets.label("pkts_recv"),
+            FlowRecord.rev_bytes.label("bytes_sent"),
+            FlowRecord.fwd_bytes.label("bytes_recv"),
+        ).where(FlowRecord.dst_ip.isnot(None))
+
+        endpoint_union = q_src.union_all(q_dst).subquery("endpoint_traffic")
+
         top_talker_rows = db.execute(
             select(
-                FlowRecord.src_ip,
-                func.coalesce(func.sum(FlowRecord.packet_count), 0).label("pkts"),
-                func.coalesce(func.sum(FlowRecord.byte_count), 0).label("bytes"),
+                endpoint_union.c.ip,
+                func.coalesce(func.sum(endpoint_union.c.pkts_sent + endpoint_union.c.pkts_recv), 0).label("pkts"),
+                func.coalesce(func.sum(endpoint_union.c.bytes_sent + endpoint_union.c.bytes_recv), 0).label("bytes"),
+                func.coalesce(func.sum(endpoint_union.c.bytes_sent), 0).label("bytes_sent"),
+                func.coalesce(func.sum(endpoint_union.c.bytes_recv), 0).label("bytes_recv"),
             )
-            .where(FlowRecord.src_ip.isnot(None))
-            .group_by(FlowRecord.src_ip)
+            .group_by(endpoint_union.c.ip)
             .order_by(desc("bytes"))
             .limit(10)
         ).all()
 
         top_talkers = [
-            {"ip": r[0], "packets": int(r[1]), "bytes": int(r[2])}
+            {
+                "ip": r[0],
+                "packets": int(r[1]),
+                "bytes": int(r[2]),
+                "bytes_sent": int(r[3]),
+                "bytes_recv": int(r[4]),
+            }
             for r in top_talker_rows
         ]
 
@@ -141,6 +180,36 @@ class FlowRepository:
             .all()
         )
 
+        # Open alerts breakdown
+        from app.models.detection import Alert, AlertSeverity, AlertStatus, DetectionJob, DetectionJobStatus
+        alert_rows = db.execute(
+            select(Alert.severity, func.count(Alert.id))
+            .where(Alert.status == AlertStatus.OPEN.value)
+            .group_by(Alert.severity)
+        ).all()
+        sev_counts = {r[0]: int(r[1]) for r in alert_rows}
+        alert_summary = {
+            "total_open": sum(sev_counts.values()),
+            "critical": sev_counts.get(AlertSeverity.CRITICAL.value, 0),
+            "high": sev_counts.get(AlertSeverity.HIGH.value, 0),
+            "medium": sev_counts.get(AlertSeverity.MEDIUM.value, 0),
+            "low": sev_counts.get(AlertSeverity.LOW.value, 0),
+        }
+
+        # Detection jobs breakdown
+        job_rows = db.execute(
+            select(DetectionJob.status, func.count(DetectionJob.id))
+            .group_by(DetectionJob.status)
+        ).all()
+        job_counts = {r[0]: int(r[1]) for r in job_rows}
+        detection_job_summary = {
+            "pending_jobs": job_counts.get(DetectionJobStatus.PENDING.value, 0),
+            "processing_jobs": job_counts.get(DetectionJobStatus.PROCESSING.value, 0),
+            "completed_jobs": job_counts.get(DetectionJobStatus.COMPLETED.value, 0),
+            "failed_jobs": job_counts.get(DetectionJobStatus.FAILED.value, 0),
+            "total_processed": job_counts.get(DetectionJobStatus.COMPLETED.value, 0) + job_counts.get(DetectionJobStatus.FAILED.value, 0),
+        }
+
         return {
             "total_sessions": total_sessions,
             "total_flows": total_flows,
@@ -149,4 +218,7 @@ class FlowRepository:
             "protocol_distribution": protocol_distribution,
             "top_talkers": top_talkers,
             "recent_flows": recent_flows,
+            "alert_summary": alert_summary,
+            "detection_jobs": detection_job_summary,
+        }
         }
