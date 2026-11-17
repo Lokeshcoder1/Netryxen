@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.schemas.detection import AlertListResponse, AlertResponse
+from app.schemas.detection import AlertListResponse, AlertResponse, AlertUpdateRequest
 from app.services.detection_service import DetectionService
 
 router = APIRouter(prefix="/alerts", tags=["Security Alerts"])
@@ -47,6 +47,37 @@ def resolve_alert(
     db: Session = Depends(get_db),
 ) -> AlertResponse:
     alert = DetectionService.resolve_alert(db=db, alert_id=alert_id)
+    if not alert:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert with ID '{alert_id}' was not found.",
+        )
+    return alert
+
+
+@router.patch(
+    "/{alert_id}/status",
+    response_model=AlertResponse,
+    summary="Update security alert lifecycle status",
+    description="Updates the lifecycle status of an alert (ACKNOWLEDGED, RESOLVED, FALSE_POSITIVE) with optional notes.",
+)
+def update_alert_status(
+    alert_id: uuid.UUID,
+    req: AlertUpdateRequest,
+    db: Session = Depends(get_db),
+) -> AlertResponse:
+    try:
+        alert = DetectionService.update_alert_status(
+            db=db,
+            alert_id=alert_id,
+            target_status=req.status,
+            notes=req.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
     if not alert:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

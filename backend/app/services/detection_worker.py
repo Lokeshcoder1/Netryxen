@@ -183,8 +183,6 @@ class DetectionWorker:
             return True
 
         except Exception as exc:
-            db.rollback()
-            # Fetch fresh job instance after rollback
             job = db.execute(select(DetectionJob).where(DetectionJob.id == job_id)).scalar_one_or_none()
             if job:
                 job.retry_count += 1

@@ -136,18 +136,21 @@ class DetectionRepository:
     def get_recent_flows_for_src_ip(
         db: Session,
         src_ip: str,
-        cutoff_time: datetime,
+        session_id: Optional[uuid.UUID] = None,
+        cutoff_time: Optional[datetime] = None,
+        upper_time: Optional[datetime] = None,
+        exclude_flow_id: Optional[uuid.UUID] = None,
         limit: int = 100,
     ) -> List[FlowRecord]:
-        stmt = (
-            select(FlowRecord)
-            .where(
-                and_(
-                    FlowRecord.src_ip == src_ip,
-                    FlowRecord.window_start >= cutoff_time,
-                )
-            )
-            .order_by(desc(FlowRecord.window_start))
-            .limit(limit)
-        )
+        query = select(FlowRecord).where(FlowRecord.src_ip == src_ip)
+        if session_id:
+            query = query.where(FlowRecord.session_id == session_id)
+        if cutoff_time:
+            query = query.where(FlowRecord.window_start >= cutoff_time)
+        if upper_time:
+            query = query.where(FlowRecord.window_start <= upper_time)
+        if exclude_flow_id:
+            query = query.where(FlowRecord.id != exclude_flow_id)
+
+        stmt = query.order_by(desc(FlowRecord.window_start)).limit(limit)
         return list(db.execute(stmt).scalars().all())

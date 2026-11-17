@@ -79,6 +79,11 @@ class PredictionListResponse(BaseModel):
 # Alert Schemas
 # ---------------------------------------------------------------------------
 
+class AlertUpdateRequest(BaseModel):
+    status: str = Field(..., description="Target status: ACKNOWLEDGED, RESOLVED, or FALSE_POSITIVE")
+    notes: Optional[str] = Field(None, description="Optional analyst resolution notes")
+
+
 class AlertResponse(BaseModel):
     id: uuid.UUID
     flow_id: Optional[uuid.UUID] = None

@@ -198,7 +198,10 @@ class ModelManager:
             "min_samples": required_samples,
         }
 
-        # Do not activate in-memory model until DB persistence succeeds
+        # Activate the newly trained model only after the artifact exists on disk and is valid.
+        # DetectionService remains responsible for rolling back if the DB registry transaction fails.
+        self.activate_model(model_id=model_id, version=v_str, pipeline=pipeline)
+
         return {
             "id": model_id,
             "name": model_name,
@@ -251,6 +254,10 @@ class ModelManager:
             raise TypeError(
                 f"Invalid model artifact: object at {path} does not implement predict and decision_function."
             )
+        if isinstance(loaded_obj, Pipeline):
+            step_names = [name for name, _ in loaded_obj.steps]
+            if "model" not in step_names:
+                raise ValueError(f"Pipeline artifact at {path} lacks estimator step 'model'. Found steps: {step_names}")
 
         with self._lock:
             self._active_pipeline = loaded_obj

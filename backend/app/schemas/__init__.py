@@ -10,6 +10,7 @@ from app.schemas.dashboard import DashboardSummaryResponse, TopTalkerItem
 from app.schemas.detection import (
     AlertListResponse,
     AlertResponse,
+    AlertUpdateRequest,
     ModelRegistryResponse,
     ModelStatusResponse,
     PredictionListResponse,
@@ -48,5 +49,6 @@ __all__ = [
     "PredictionResponse",
     "PredictionListResponse",
     "AlertResponse",
+    "AlertUpdateRequest",
     "AlertListResponse",
 ]

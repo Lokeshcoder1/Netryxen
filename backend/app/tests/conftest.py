@@ -11,20 +11,26 @@ from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import Ether
 from scapy.packet import Packet
 
+import os
+
 from app.capture.capture_manager import capture_manager
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
 from app.models.capture_session import CaptureSession
 
-# In-memory SQLite engine for fast, isolated, deterministic unit tests
-TEST_DATABASE_URL = "sqlite:///:memory:"
+# Support dedicated PostgreSQL integration tests when TEST_DATABASE_URL is set,
+# while preserving SQLite in-memory as default for fast, isolated unit tests.
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "sqlite:///:memory:")
 
-test_engine = create_engine(
-    TEST_DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-)
+if "sqlite" in TEST_DATABASE_URL:
+    test_engine = create_engine(
+        TEST_DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+else:
+    test_engine = create_engine(TEST_DATABASE_URL)
 
 TestingSessionLocal = sessionmaker(
     autocommit=False,
@@ -69,7 +75,13 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 
 @pytest.fixture(autouse=True)
 def reset_capture_manager():
-    """Ensure capture manager is cleanly stopped and reset around every test."""
+    """Ensure capture manager, detection worker, and model manager are cleanly reset around every test."""
+    from app.services.detection_worker import detection_worker
+    if detection_worker.is_running:
+        try:
+            detection_worker.stop()
+        except Exception:
+            pass
     if capture_manager.is_running:
         try:
             capture_manager.stop_capture()
@@ -77,6 +89,11 @@ def reset_capture_manager():
             pass
     capture_manager.packet_queue.reset()
     yield
+    if detection_worker.is_running:
+        try:
+            detection_worker.stop()
+        except Exception:
+            pass
     if capture_manager.is_running:
         try:
             capture_manager.stop_capture()

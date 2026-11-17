@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 import numpy as np
 
+from app.core.config import settings
 from app.models.detection import AlertSeverity
 
 
@@ -42,25 +43,79 @@ class RuleEngine:
 
     def __init__(
         self,
-        syn_ratio_threshold: float = 5.0,
-        high_pps_threshold: float = 500.0,
-        high_bps_threshold: float = 5_000_000.0,
-        high_rst_count_threshold: int = 5,
-        high_dns_query_threshold: int = 25,
-        port_scan_distinct_ports: int = 10,
-        port_scan_window_seconds: int = 60,
-        beacon_min_intervals: int = 4,
-        beacon_max_packets_per_flow: int = 10,
+        syn_ratio_threshold: Optional[float] = None,
+        syn_min_packets: Optional[int] = None,
+        high_pps_threshold: Optional[float] = None,
+        high_bps_threshold: Optional[float] = None,
+        high_rst_count_threshold: Optional[int] = None,
+        high_dns_query_threshold: Optional[int] = None,
+        port_scan_distinct_ports: Optional[int] = None,
+        port_scan_window_seconds: Optional[int] = None,
+        beacon_min_intervals: Optional[int] = None,
+        beacon_max_packets_per_flow: Optional[int] = None,
+        beacon_max_jitter_seconds: Optional[float] = None,
+        beacon_max_cv: Optional[float] = None,
     ) -> None:
-        self.syn_ratio_threshold = syn_ratio_threshold
-        self.high_pps_threshold = high_pps_threshold
-        self.high_bps_threshold = high_bps_threshold
-        self.high_rst_count_threshold = high_rst_count_threshold
-        self.high_dns_query_threshold = high_dns_query_threshold
-        self.port_scan_distinct_ports = port_scan_distinct_ports
-        self.port_scan_window_seconds = port_scan_window_seconds
-        self.beacon_min_intervals = beacon_min_intervals
-        self.beacon_max_packets_per_flow = beacon_max_packets_per_flow
+        self.syn_ratio_threshold = (
+            syn_ratio_threshold
+            if syn_ratio_threshold is not None
+            else getattr(settings, "RULE_SYN_RATIO_THRESHOLD", 5.0)
+        )
+        self.syn_min_packets = (
+            syn_min_packets
+            if syn_min_packets is not None
+            else getattr(settings, "RULE_SYN_MIN_PACKETS", 10)
+        )
+        self.high_pps_threshold = (
+            high_pps_threshold
+            if high_pps_threshold is not None
+            else getattr(settings, "RULE_HIGH_PPS_THRESHOLD", 500.0)
+        )
+        self.high_bps_threshold = (
+            high_bps_threshold
+            if high_bps_threshold is not None
+            else getattr(settings, "RULE_HIGH_BPS_THRESHOLD", 5_000_000.0)
+        )
+        self.high_rst_count_threshold = (
+            high_rst_count_threshold
+            if high_rst_count_threshold is not None
+            else getattr(settings, "RULE_HIGH_RST_THRESHOLD", 5)
+        )
+        self.high_dns_query_threshold = (
+            high_dns_query_threshold
+            if high_dns_query_threshold is not None
+            else getattr(settings, "RULE_HIGH_DNS_THRESHOLD", 25)
+        )
+        self.port_scan_distinct_ports = (
+            port_scan_distinct_ports
+            if port_scan_distinct_ports is not None
+            else getattr(settings, "RULE_PORT_SCAN_DISTINCT_PORTS", 10)
+        )
+        self.port_scan_window_seconds = (
+            port_scan_window_seconds
+            if port_scan_window_seconds is not None
+            else getattr(settings, "RULE_PORT_SCAN_WINDOW_SECONDS", 60)
+        )
+        self.beacon_min_intervals = (
+            beacon_min_intervals
+            if beacon_min_intervals is not None
+            else getattr(settings, "RULE_BEACON_MIN_INTERVALS", 4)
+        )
+        self.beacon_max_packets_per_flow = (
+            beacon_max_packets_per_flow
+            if beacon_max_packets_per_flow is not None
+            else getattr(settings, "RULE_BEACON_MAX_PACKETS_PER_FLOW", 10)
+        )
+        self.beacon_max_jitter_seconds = (
+            beacon_max_jitter_seconds
+            if beacon_max_jitter_seconds is not None
+            else getattr(settings, "RULE_BEACON_MAX_JITTER_SECONDS", 3.0)
+        )
+        self.beacon_max_cv = (
+            beacon_max_cv
+            if beacon_max_cv is not None
+            else getattr(settings, "RULE_BEACON_MAX_CV", 0.25)
+        )
 
     def evaluate_flow(
         self,
@@ -128,12 +183,12 @@ class RuleEngine:
         syn = getattr(flow, "tcp_syn_count", 0)
         ack = getattr(flow, "tcp_ack_count", 0)
 
-        # Case A: 10 or more SYNs with 0 ACKs
-        # Case B: 15 or more SYNs with SYN/ACK ratio > 5.0
+        # Case A: syn_min_packets or more SYNs with 0 ACKs
+        # Case B: 15 or more SYNs with SYN/ACK ratio > syn_ratio_threshold
         is_syn_heavy = False
-        if syn >= 10 and ack == 0:
+        if syn >= self.syn_min_packets and ack == 0:
             is_syn_heavy = True
-        elif syn >= 15 and (ack == 0 or (syn / max(1, ack)) >= self.syn_ratio_threshold):
+        elif syn >= max(15, self.syn_min_packets) and (ack == 0 or (syn / max(1, ack)) >= self.syn_ratio_threshold):
             is_syn_heavy = True
 
         if is_syn_heavy:
@@ -149,14 +204,14 @@ class RuleEngine:
                     "tcp_syn_count": syn,
                     "tcp_ack_count": ack,
                     "protocol": proto,
-                    "threshold_syn": 10,
+                    "threshold_syn": self.syn_min_packets,
                 },
             )
         return None
 
     def _check_high_rate(self, flow: Any) -> Optional[RuleFinding]:
-        pps = getattr(flow, "packets_per_second", 0.0)
-        bps = getattr(flow, "bytes_per_second", 0.0)
+        pps = float(getattr(flow, "packets_per_second", 0.0) or 0.0)
+        bps = float(getattr(flow, "bytes_per_second", 0.0) or 0.0)
 
         if pps >= self.high_pps_threshold or bps >= self.high_bps_threshold:
             return RuleFinding(
@@ -172,7 +227,7 @@ class RuleEngine:
                     "bytes_per_second": bps,
                     "threshold_pps": self.high_pps_threshold,
                     "threshold_bps": self.high_bps_threshold,
-                    "duration_seconds": getattr(flow, "duration_seconds", 0.0),
+                    "duration_seconds": getattr(flow, "duration_seconds", 0.0) or 0.0,
                 },
             )
         return None
@@ -182,8 +237,8 @@ class RuleEngine:
         if proto != "TCP":
             return None
 
-        rst = getattr(flow, "tcp_rst_count", 0)
-        total_pkts = getattr(flow, "packet_count", 0)
+        rst = getattr(flow, "tcp_rst_count", 0) or 0
+        total_pkts = getattr(flow, "packet_count", 0) or 0
 
         if rst >= self.high_rst_count_threshold and (rst / max(1, total_pkts) >= 0.25 or rst >= 10):
             return RuleFinding(
@@ -203,8 +258,8 @@ class RuleEngine:
         return None
 
     def _check_high_dns(self, flow: Any) -> Optional[RuleFinding]:
-        q_count = getattr(flow, "dns_query_count", 0)
-        uq_count = getattr(flow, "dns_unique_query_count", 0)
+        q_count = getattr(flow, "dns_query_count", 0) or 0
+        uq_count = getattr(flow, "dns_unique_query_count", 0) or 0
 
         if q_count >= self.high_dns_query_threshold or uq_count >= (self.high_dns_query_threshold // 2):
             return RuleFinding(
@@ -243,10 +298,10 @@ class RuleEngine:
         return None
 
     def _check_broadcast_multicast(self, flow: Any) -> Optional[RuleFinding]:
-        is_bcast = getattr(flow, "is_broadcast", False)
-        is_mcast = getattr(flow, "is_multicast", False)
-        pkts = getattr(flow, "packet_count", 0)
-        pps = getattr(flow, "packets_per_second", 0.0)
+        is_bcast = bool(getattr(flow, "is_broadcast", False))
+        is_mcast = bool(getattr(flow, "is_multicast", False))
+        pkts = getattr(flow, "packet_count", 0) or 0
+        pps = float(getattr(flow, "packets_per_second", 0.0) or 0.0)
 
         if (is_bcast or is_mcast) and (pkts >= 50 or pps >= 50.0):
             kind = "Broadcast" if is_bcast else "Multicast"
@@ -379,8 +434,10 @@ class RuleEngine:
         mean_interval = float(np.mean(intervals))
         std_interval = float(np.std(intervals))
 
-        # Check for regular timing: standard deviation within 3.0 seconds or coefficient of variation <= 0.25
-        is_periodic = (std_interval <= 3.0) or (mean_interval > 0 and (std_interval / mean_interval) <= 0.25)
+        # Check for regular timing: standard deviation within max_jitter or coefficient of variation <= max_cv
+        is_periodic = (std_interval <= self.beacon_max_jitter_seconds) or (
+            mean_interval > 0 and (std_interval / mean_interval) <= self.beacon_max_cv
+        )
 
         if is_periodic and mean_interval >= 5.0:
             return RuleFinding(

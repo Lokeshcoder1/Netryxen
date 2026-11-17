@@ -32,7 +32,8 @@ Netryxen/
 │   │   └── versions/
 │   │       ├── 001_initial_capture_sessions.py  # Capture sessions schema
 │   │       ├── 002_flow_records.py              # Flow records schema
-│   │       └── 003_detection_tables.py          # Model registry, predictions, alerts
+│   │       ├── 003_detection_tables.py          # Model registry, predictions, alerts
+│   │       └── 004_detection_jobs.py           # Outbox detection queue table
 │   └── app/
 │       ├── main.py                  # FastAPI entry point & lifespan manager
 │       ├── api/
@@ -60,7 +61,7 @@ Netryxen/
 │       ├── models/
 │       │   ├── capture_session.py   # CaptureSession model with check constraints
 │       │   ├── flow_record.py       # FlowRecord model with JSONB features
-│       │   └── detection.py         # ModelRegistry, Prediction, Alert models
+│       │   └── detection.py         # ModelRegistry, Prediction, Alert, DetectionJob
 │       ├── schemas/
 │       │   ├── capture.py           # Request/response schemas for capture
 │       │   ├── packet.py            # Privacy-safe packet metadata schema
@@ -71,13 +72,14 @@ Netryxen/
 │       │   └── error.py             # Standard error schemas
 │       ├── repositories/
 │       │   ├── capture_repository.py# CaptureSession persistence queries
-│       │   ├── flow_repository.py   # FlowRecord bulk insert & filtered queries
+│       │   ├── flow_repository.py   # FlowRecord bulk insert & outbox scheduling
 │       │   └── detection_repository.py# Model, prediction, alert data access
 │       ├── services/
 │       │   ├── capture_service.py   # Capture business logic coordinator
 │       │   ├── flow_service.py      # Flow query & dashboard service
 │       │   ├── alert_service.py     # Alert decision policy & deduplication
-│       │   └── detection_service.py # ML training & inference coordinator
+│       │   ├── detection_service.py # ML training & inference coordinator
+│       │   └── detection_worker.py  # Background transactional outbox worker
 │       ├── capture/
 │       │   ├── interface_discovery.py# Npcap/Windows network adapter discovery
 │       │   ├── packet_parser.py     # Privacy-preserving packet header parser
@@ -97,7 +99,11 @@ Netryxen/
 │           ├── test_ml_model.py     # Baseline training, serialization, inference
 │           ├── test_rules.py        # 8 Behavioral rules positive & negative tests
 │           ├── test_alert_service.py# Alert policy, deduplication, resolution
-│           └── test_api_detection.py# Models, predictions, alerts API tests
+│           ├── test_api_detection.py# Models, predictions, alerts API tests
+│           ├── test_detection_worker.py # Transactional outbox worker processing & retries
+│           ├── test_alert_elevation.py  # Alert severity elevation & full lifecycle status
+│           ├── test_rule_engine_bounds.py # Time-bounded history & strict rule conditions
+│           └── test_inherited_defects.py # Parser, rollback, late packet & top-talker tests
 ```
 
 ---
@@ -404,9 +410,104 @@ Rates (`packets_per_second`, `bytes_per_second`) use an effective duration clamp
 
 Rules operate completely independently when the ML model is offline or unready.
 
-### Deduplication & Alert Lifecycle
+### Deduplication & Alert Lifecycle Management
 
 - **Fingerprint**: Deterministic string `RULE_ID:SRC_IP->DST_IP:DST_PORT:PROTOCOL`.
 - **Cooldown Window**: 300 seconds (`ALERT_COOLDOWN_SECONDS`).
-- **Deduplication**: When an open alert matches an incoming fingerprint within the cooldown period, its `occurrence_count` is incremented and `last_seen` is updated. Unlimited duplicate alert rows are prevented.
-- **Resolution**: Open alerts can be marked as `RESOLVED` via `PATCH /api/v1/alerts/{alert_id}/resolve` which timestamps `resolved_at`.
+- **Deduplication & Elevation Policy**: When an active alert matches an incoming fingerprint within the cooldown period:
+  - Its `occurrence_count` is incremented and `last_seen` is updated to the latest flow timestamp.
+  - Its `severity` is elevated if the new observation carries higher severity (e.g., `MEDIUM` -> `HIGH` -> `CRITICAL`). Severity is **never downgraded**.
+  - Its `evidence` dict merges the newest detection details and preserves the highest severity event.
+  - Concurrency mutex (`_alert_lock`) prevents race conditions and duplicate insertions under concurrent flow analysis.
+- **Full Lifecycle Status Transitions**:
+  - `OPEN` (default on generation)
+  - `ACKNOWLEDGED` (analyst triage in progress)
+  - `RESOLVED` (threat addressed; sets `resolved_at` UTC timestamp)
+  - `FALSE_POSITIVE` (dismissed with explanation; sets `resolved_at` UTC timestamp)
+  - Updated via: `PATCH /api/v1/alerts/{alert_id}/status` with body `{"status": "ACKNOWLEDGED" | "RESOLVED" | "FALSE_POSITIVE", "notes": "optional"}`.
+  - Legacy convenience endpoint `PATCH /api/v1/alerts/{alert_id}/resolve` remains supported for backward compatibility.
+
+---
+
+## 10. Transactional Outbox & Asynchronous Detection Worker
+
+To decouple high-throughput packet flow aggregation from ML feature extraction, inference, and behavioral rules, NETRYXEN uses an ACID **Transactional Outbox** pattern:
+
+```
+Flow Aggregator (10s window)
+          |
+          v
+INSERT flow_records + INSERT detection_jobs (PENDING)   [Atomic DB Transaction]
+          |
+          v
+PostgreSQL Outbox Queue (`detection_jobs`)
+          |
+          v
+DetectionWorker (Background Thread)
+   ├── Claim via `SELECT ... FOR UPDATE SKIP LOCKED` (batch up to 50)
+   ├── Extract features & run Isolation Forest inference
+   ├── Evaluate 8 Behavioral Rules (strictly time & session bounded)
+   ├── Trigger AlertService (elevation & deduplication)
+   └── Mark job `COMPLETED` (or `FAILED` with exponential retry backoff)
+```
+
+### Worker Resiliency Guarantees
+
+1. **At-Least-Once Delivery**: No flow is silently ignored or lost if detection takes time.
+2. **Crash & Stuck Job Recovery**: Jobs in `PROCESSING` status for longer than 300 seconds without heartbeat are reclaimed automatically via `reclaim_stuck_jobs`.
+3. **Database Portability**: Uses PostgreSQL's high-concurrency `FOR UPDATE SKIP LOCKED` for claiming jobs. Falls back smoothly to serialized status claiming on SQLite during lightweight test execution.
+4. **Lifecycle Hooks**: Integrated into FastAPI's lifespan context (`main.py`). The worker cleanly starts on server boot and stops on server shutdown without interrupting active transactions.
+
+---
+
+## 11. React + TypeScript Frontend Integration Guide
+
+The backend is fully prepared for React + TypeScript frontend integration:
+
+### 1. CORS Configuration
+CORS is configured out-of-the-box for standard Vite/React development ports:
+- `http://localhost:5173`
+- `http://127.0.0.1:5173`
+- `http://localhost:3000`
+- `http://127.0.0.1:3000`
+
+### 2. Primary REST API Endpoints
+
+| Category | Method | Endpoint | Description |
+|---|---|---|---|
+| **Health Probes** | `GET` | `/api/v1/health/live` | Liveness probe (`{"status": "alive"}`) |
+| | `GET` | `/api/v1/health/ready` | Readiness probe (verifies DB connection) |
+| **Capture Control** | `GET` | `/api/v1/capture/interfaces` | List network adapters with MAC, IPs, friendly names |
+| | `GET` | `/api/v1/capture/status` | Live capture engine status, packets seen/enqueued/dropped, active flows |
+| | `POST` | `/api/v1/capture/start` | Start capture: `{"interface_id": "Wi-Fi", "session_mode": "MONITORING"}` |
+| | `POST` | `/api/v1/capture/stop` | Stop active capture session and flush flow windows |
+| | `GET` | `/api/v1/capture/sessions` | Paginated capture sessions list |
+| | `GET` | `/api/v1/capture/preview` | Real-time preview ring buffer of recent packets |
+| **Flow Analytics** | `GET` | `/api/v1/flows` | Paginated flows with filters (`session_id`, `protocol`, `ip`, `start_time`, `end_time`) |
+| | `GET` | `/api/v1/flows/{flow_id}` | Detailed flow record with all 22 computed features |
+| **Dashboard** | `GET` | `/api/v1/dashboard/summary` | Unified dashboard stats: flows, sessions, top-talkers, alert counts, and worker health |
+| **ML Models** | `GET` | `/api/v1/models/status` | Current active model version, schema, SHA-256 hash |
+| | `POST` | `/api/v1/models/train-baseline` | Train Isolation Forest on completed `BASELINE` session |
+| **Predictions** | `GET` | `/api/v1/predictions` | Prediction history with filters (`label`, `session_id`, `min_score`, `max_score`) |
+| | `POST` | `/api/v1/predictions/predict-flow/{id}` | On-demand manual flow evaluation |
+| **Alert Management**| `GET` | `/api/v1/alerts` | Filtered security alerts (`status`, `severity`, `session_id`, `rule_id`) |
+| | `GET` | `/api/v1/alerts/{alert_id}` | Alert detail with full evidence breakdown |
+| | `PATCH` | `/api/v1/alerts/{alert_id}/status` | Update alert lifecycle (`OPEN`, `ACKNOWLEDGED`, `RESOLVED`, `FALSE_POSITIVE`) |
+| | `PATCH` | `/api/v1/alerts/{alert_id}/resolve` | Convenience resolve endpoint |
+
+### 3. Running Live Verification & Tests
+
+```powershell
+# Run all automated tests (90 unit, regression & integration tests)
+.\.venv\Scripts\pytest backend\app\tests -v
+
+# Run end-to-end ML & alert verification against PostgreSQL
+.\.venv\Scripts\python backend/verify_detection.py
+
+# Run live packet capture & flow aggregation verification on Windows (Npcap)
+.\.venv\Scripts\python backend/verify_live_windows.py
+
+# Start the backend server for React development
+.\.venv\Scripts\uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
