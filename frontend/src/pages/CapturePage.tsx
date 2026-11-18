@@ -33,13 +33,19 @@ export default function CapturePage() {
   const startMut = useMutation({
     mutationFn: () => startCapture({ interface_id: selectedIface, session_mode: mode, bpf_filter: bpf || undefined }),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['captureStatus'] }); setErrorMsg(null) },
-    onError: (e: any) => setErrorMsg(e?.response?.data?.detail ?? 'Start failed'),
+    onError: (error: unknown) => {
+      const detail = (error as { message?: string })?.message
+      setErrorMsg(detail ?? 'Start failed')
+    },
   })
 
   const stopMut = useMutation({
     mutationFn: stopCapture,
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['captureStatus'] }); qc.invalidateQueries({ queryKey: ['dashboard'] }) },
-    onError: (e: any) => setErrorMsg(e?.response?.data?.detail ?? 'Stop failed'),
+    onError: (error: unknown) => {
+      const detail = (error as { message?: string })?.message
+      setErrorMsg(detail ?? 'Stop failed')
+    },
   })
 
   if (ifaceLoading || statusLoading) return <><TopBar title="Capture" /><PageSpinner /></>

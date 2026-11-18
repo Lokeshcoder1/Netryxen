@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     JSON,
     String,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -238,6 +239,12 @@ class FlowRecord(Base):
 
     __table_args__ = (
         Index("ix_flow_records_session_window", "session_id", "window_start"),
+        UniqueConstraint(
+            "session_id",
+            "flow_key",
+            "window_start",
+            name="uq_flow_records_session_flow_window",
+        ),
     )
 
     def __repr__(self) -> str:

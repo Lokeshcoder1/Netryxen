@@ -9,7 +9,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 import uuid
 
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -38,6 +38,7 @@ class DetectionWorker:
         self._session_factory = session_factory
 
         self._lock = threading.Lock()
+        self.worker_id = f"detection-worker-{uuid.uuid4().hex}"
         self._is_running: bool = False
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -76,17 +77,23 @@ class DetectionWorker:
     def stop(self, timeout: float = 10.0) -> None:
         """Gracefully stops the worker thread, waiting for in-flight jobs to complete."""
         with self._lock:
-            if not self._is_running:
+            worker_thread = self._worker_thread
+            if not self._is_running and worker_thread is None:
                 return
             self._is_running = False
             self._stop_event.set()
 
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=timeout)
-
+        if worker_thread and worker_thread.is_alive():
+            worker_thread.join(timeout=timeout)
         with self._lock:
-            self._worker_thread = None
-        logger.info("DetectionWorker background thread stopped.")
+            terminated = worker_thread is None or not worker_thread.is_alive()
+            if terminated:
+                self._worker_thread = None
+        if terminated:
+            logger.info("DetectionWorker background thread stopped.")
+        else:
+            logger.error("DetectionWorker thread did not terminate within the shutdown timeout.")
+            raise RuntimeError("DetectionWorker shutdown timeout")
 
     def reclaim_stuck_jobs(self, db: Session, timeout_seconds: Optional[int] = None) -> int:
         """
@@ -94,21 +101,35 @@ class DetectionWorker:
         Resets them to 'PENDING'.
         """
         timeout = timeout_seconds or self.stuck_timeout_seconds
-        stuck_cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout)
+        now = datetime.now(timezone.utc)
+        stuck_cutoff = now - timedelta(seconds=timeout)
 
         stuck_stmt = (
             select(DetectionJob)
             .where(
                 and_(
                     DetectionJob.status == DetectionJobStatus.PROCESSING.value,
-                    DetectionJob.started_at <= stuck_cutoff,
+                    or_(
+                        DetectionJob.lease_expires_at <= now,
+                        and_(
+                            DetectionJob.lease_expires_at.is_(None),
+                            or_(
+                                DetectionJob.started_at.is_(None),
+                                DetectionJob.started_at <= stuck_cutoff,
+                            ),
+                        ),
+                    ),
                 )
             )
+            .with_for_update(skip_locked=True)
         )
         stuck_jobs = list(db.execute(stuck_stmt).scalars().all())
         for job in stuck_jobs:
             job.status = DetectionJobStatus.PENDING.value
             job.started_at = None
+            job.worker_id = None
+            job.heartbeat_at = None
+            job.lease_expires_at = None
             job.error_message = "Reclaimed from stuck PROCESSING state."
         if stuck_jobs:
             db.commit()
@@ -127,7 +148,10 @@ class DetectionWorker:
             select(DetectionJob)
             .where(
                 or_(
-                    DetectionJob.status == DetectionJobStatus.PENDING.value,
+                    and_(
+                        DetectionJob.status == DetectionJobStatus.PENDING.value,
+                        DetectionJob.scheduled_at <= now,
+                    ),
                     and_(
                         DetectionJob.status == DetectionJobStatus.FAILED.value,
                         DetectionJob.retry_count < DetectionJob.max_retries,
@@ -151,6 +175,11 @@ class DetectionWorker:
         for job in jobs:
             job.status = DetectionJobStatus.PROCESSING.value
             job.started_at = now
+            if job.max_retries != self.max_retries:
+                job.max_retries = self.max_retries
+            job.worker_id = self.worker_id
+            job.heartbeat_at = now
+            job.lease_expires_at = now + timedelta(seconds=self.stuck_timeout_seconds)
             claimed_ids.append(job.id)
 
         if claimed_ids:
@@ -166,39 +195,128 @@ class DetectionWorker:
         job = db.execute(select(DetectionJob).where(DetectionJob.id == job_id)).scalar_one_or_none()
         if not job:
             return False
-
+        if job.status == DetectionJobStatus.COMPLETED.value:
+            return True
         now = datetime.now(timezone.utc)
+        if job.status != DetectionJobStatus.PROCESSING.value or job.worker_id != self.worker_id:
+            return False
+        lease = job.lease_expires_at
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=timezone.utc)
+        if lease is not None and lease <= datetime.now(timezone.utc):
+            return False
+
+        heartbeat = self._start_heartbeat(db, job_id)
         try:
             from app.services.detection_service import DetectionService
 
             # Evaluate flow (runs ML inference, behavioral rules, and alert deduplication)
             DetectionService.predict_flow(db=db, flow_id=job.flow_id)
-
-            job.status = DetectionJobStatus.COMPLETED.value
-            job.completed_at = now
-            job.error_message = None
+            self._stop_heartbeat(heartbeat)
+            owned = db.execute(
+                update(DetectionJob)
+                .where(
+                    DetectionJob.id == job_id,
+                    DetectionJob.status == DetectionJobStatus.PROCESSING.value,
+                    DetectionJob.worker_id == self.worker_id,
+                )
+                .values(
+                    status=DetectionJobStatus.COMPLETED.value,
+                    completed_at=now,
+                    error_message=None,
+                    worker_id=None,
+                    heartbeat_at=now,
+                    lease_expires_at=None,
+                )
+            )
+            if owned.rowcount != 1:
+                raise RuntimeError(f"Detection job {job_id} is no longer owned by this worker")
             db.commit()
             with self._lock:
                 self._total_processed += 1
             return True
 
         except Exception as exc:
+            self._stop_heartbeat(heartbeat)
+            db.rollback()
             job = db.execute(select(DetectionJob).where(DetectionJob.id == job_id)).scalar_one_or_none()
             if job:
+                if job.worker_id not in (None, self.worker_id):
+                    return False
+                job.worker_id = self.worker_id
                 job.retry_count += 1
                 job.error_message = str(exc)[:1000]
-                if job.retry_count >= job.max_retries:
-                    job.status = DetectionJobStatus.FAILED.value
-                else:
-                    job.status = DetectionJobStatus.FAILED.value
-                    backoff = 2 ** job.retry_count
-                    job.scheduled_at = now + timedelta(seconds=backoff)
+                job.status = DetectionJobStatus.FAILED.value
+                job.worker_id = None
+                job.heartbeat_at = None
+                job.lease_expires_at = None
+                if job.retry_count < job.max_retries:
+                    job.scheduled_at = now + timedelta(seconds=2 ** job.retry_count)
                 db.commit()
 
             with self._lock:
                 self._total_errors += 1
-            logger.error(f"Error processing detection job {job_id} (flow {job.flow_id if job else 'unknown'}): {exc}")
+            logger.error(
+                f"Error processing detection job {job_id} "
+                f"(flow {job.flow_id if job else 'unknown'}): {exc}"
+            )
             return False
+
+    def _start_heartbeat(
+        self,
+        db: Session,
+        job_id: uuid.UUID,
+    ) -> Optional[tuple[threading.Event, threading.Thread]]:
+        probe = self._get_db()
+        if probe is db:
+            return None
+        probe.close()
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(job_id, stop_event),
+            name=f"DetectionHeartbeat-{job_id}",
+            daemon=True,
+        )
+        thread.start()
+        return stop_event, thread
+
+    def _heartbeat_loop(self, job_id: uuid.UUID, stop_event: threading.Event) -> None:
+        interval = max(1.0, self.stuck_timeout_seconds / 3)
+        while not stop_event.wait(interval):
+            db = self._get_db()
+            now = datetime.now(timezone.utc)
+            try:
+                result = db.execute(
+                    update(DetectionJob)
+                    .where(
+                        DetectionJob.id == job_id,
+                        DetectionJob.status == DetectionJobStatus.PROCESSING.value,
+                        DetectionJob.worker_id == self.worker_id,
+                    )
+                    .values(
+                        heartbeat_at=now,
+                        lease_expires_at=now + timedelta(seconds=self.stuck_timeout_seconds),
+                    )
+                )
+                db.commit()
+                if result.rowcount != 1:
+                    logger.warning(f"DetectionWorker lost ownership of job {job_id}.")
+                    return
+            except Exception as exc:
+                db.rollback()
+                logger.warning(f"Could not renew lease for detection job {job_id}: {exc}")
+            finally:
+                db.close()
+
+    @staticmethod
+    def _stop_heartbeat(
+        heartbeat: Optional[tuple[threading.Event, threading.Thread]],
+    ) -> None:
+        if heartbeat:
+            stop_event, thread = heartbeat
+            stop_event.set()
+            thread.join(timeout=2.0)
 
     def _worker_loop(self) -> None:
         """Main continuous background processing loop."""
@@ -226,8 +344,9 @@ class DetectionWorker:
                         self.reclaim_stuck_jobs(db)
 
                     claimed_ids = self._claim_batch(db)
-                    for job_id in claimed_ids:
+                    for index, job_id in enumerate(claimed_ids):
                         if self._stop_event.is_set():
+                            self._release_claimed_jobs(db, claimed_ids[index:])
                             break
                         self.process_job(db, job_id)
                         processed_count += 1
@@ -245,6 +364,27 @@ class DetectionWorker:
             # If no jobs were ready, sleep until interval or stop signal
             if processed_count == 0:
                 self._stop_event.wait(timeout=self.interval_seconds)
+
+    def _release_claimed_jobs(self, db: Session, job_ids: List[uuid.UUID]) -> None:
+        if not job_ids:
+            return
+        jobs = list(
+            db.execute(
+                select(DetectionJob).where(
+                    DetectionJob.id.in_(job_ids),
+                    DetectionJob.status == DetectionJobStatus.PROCESSING.value,
+                    DetectionJob.worker_id == self.worker_id,
+                )
+            ).scalars()
+        )
+        for job in jobs:
+            job.status = DetectionJobStatus.PENDING.value
+            job.started_at = None
+            job.worker_id = None
+            job.heartbeat_at = None
+            job.lease_expires_at = None
+        if jobs:
+            db.commit()
 
     def get_stats(self) -> Dict[str, Any]:
         """Returns runtime statistics of the worker."""

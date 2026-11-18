@@ -285,6 +285,40 @@ def test_flow_aggregator_flush_to_db(db_session: Session):
     assert flow.rev_packets == 1
 
 
+def test_failed_flow_persistence_retains_window_for_retry(db_session: Session, monkeypatch):
+    from app.repositories.flow_repository import FlowRepository
+
+    session_id = uuid.uuid4()
+    db_session.add(CaptureSession(
+        id=session_id,
+        interface_id="retry-test",
+        session_mode=SessionMode.MONITORING.value,
+        status=CaptureStatus.RUNNING.value,
+    ))
+    db_session.commit()
+    aggregator = FlowAggregator(session_factory=lambda: db_session)
+    aggregator._active_session_id = session_id
+    packet = make_packet(timestamp=datetime.now(timezone.utc) - timedelta(seconds=30))
+    aggregator._process_packet(packet)
+
+    original_create_batch = FlowRepository.create_batch
+    failures_remaining = 1
+
+    def fail_once(db, records, create_jobs=True):
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise RuntimeError("simulated database outage")
+        return original_create_batch(db, records, create_jobs=create_jobs)
+
+    monkeypatch.setattr(FlowRepository, "create_batch", staticmethod(fail_once))
+    assert aggregator._finalize_windows(force_all=True) == 0
+    assert aggregator.get_stats()["active_windows_count"] == 1
+    assert aggregator._finalize_windows(force_all=True) == 1
+    assert aggregator.get_stats()["active_windows_count"] == 0
+    assert db_session.query(FlowRecord).filter(FlowRecord.session_id == session_id).count() == 1
+
+
 def test_multiple_time_windows_separation(db_session: Session):
     session_id = uuid.uuid4()
     cap_session = CaptureSession(

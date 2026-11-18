@@ -45,13 +45,17 @@ def predict_flow(
     db: Session = Depends(get_db),
 ) -> PredictionResponse:
     try:
-        return DetectionService.predict_flow(db=db, flow_id=flow_id)
+        result = DetectionService.predict_flow(db=db, flow_id=flow_id)
+        db.commit()
+        return result
     except ValueError as val_err:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(val_err),
         )
     except Exception as exc:
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Inference execution failed: {str(exc)}",

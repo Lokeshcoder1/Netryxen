@@ -24,7 +24,7 @@ export default function ModelPage() {
       queryClient.invalidateQueries({ queryKey: ['modelStatus'] })
     },
     onError: (error: unknown) => {
-      const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      const detail = (error as { message?: string })?.message
       setMessage(detail ?? 'Training failed')
     },
   })

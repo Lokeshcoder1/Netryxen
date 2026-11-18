@@ -2,6 +2,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy import desc, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.models.capture_session import CaptureSession
@@ -21,8 +23,31 @@ class FlowRepository:
         """
         if not records:
             return 0
-        db.add_all(records)
-        db.flush()
+        dialect = db.bind.dialect.name if db.bind else ""
+        if dialect in {"postgresql", "sqlite"}:
+            insert_fn = postgresql_insert if dialect == "postgresql" else sqlite_insert
+            values = [
+                {
+                    column.key: record.__dict__[column.key]
+                    for column in FlowRecord.__table__.columns
+                    if column.key in record.__dict__
+                }
+                for record in records
+            ]
+            statement = (
+                insert_fn(FlowRecord)
+                .values(values)
+                .on_conflict_do_nothing(
+                    index_elements=["session_id", "flow_key", "window_start"]
+                )
+                .returning(FlowRecord.id)
+            )
+            inserted_ids = set(db.execute(statement).scalars())
+            inserted_records = [record for record in records if record.id in inserted_ids]
+        else:
+            db.add_all(records)
+            db.flush()
+            inserted_records = records
         if create_jobs:
             from datetime import datetime, timezone
             from app.models.detection import DetectionJob, DetectionJobStatus
@@ -34,11 +59,12 @@ class FlowRepository:
                     status=DetectionJobStatus.PENDING.value,
                     scheduled_at=now,
                 )
-                for r in records
+                for r in inserted_records
             ]
-            db.add_all(jobs)
+            if jobs:
+                db.add_all(jobs)
         db.commit()
-        return len(records)
+        return len(inserted_records)
 
     @staticmethod
     def get_by_id(db: Session, flow_id: uuid.UUID) -> Optional[FlowRecord]:
