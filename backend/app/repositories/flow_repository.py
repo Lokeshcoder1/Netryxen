@@ -22,6 +22,7 @@ class FlowRepository:
         if not records:
             return 0
         db.add_all(records)
+        db.flush()
         if create_jobs:
             from datetime import datetime, timezone
             from app.models.detection import DetectionJob, DetectionJobStatus
@@ -220,5 +221,4 @@ class FlowRepository:
             "recent_flows": recent_flows,
             "alert_summary": alert_summary,
             "detection_jobs": detection_job_summary,
-        }
         }

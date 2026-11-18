@@ -40,6 +40,24 @@ class DetectionService:
     """
 
     @staticmethod
+    def _restore_previous_active_model(db: Session, previous_model_id: Optional[uuid.UUID]) -> None:
+        """Restores the previously active model when a new training registration fails."""
+        if previous_model_id:
+            previous = DetectionRepository.get_model_by_id(db=db, model_id=previous_model_id)
+            if previous and previous.artifact_path:
+                try:
+                    model_manager.load_artifact(
+                        artifact_path=previous.artifact_path,
+                        expected_checksum=previous.artifact_checksum,
+                        model_id=previous.id,
+                        model_version=previous.version,
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning(f"Could not restore previous model '{previous_model_id}': {exc}")
+        model_manager.reset()
+
+    @staticmethod
     def train_baseline(db: Session, req: TrainBaselineRequest) -> ModelRegistryResponse:
         # 1. Validate capture session
         session = CaptureRepository.get_by_id(db=db, session_id=req.session_id)
@@ -53,6 +71,13 @@ class DetectionService:
                 "training on unverified monitoring traffic."
             )
 
+        from app.models.capture_session import CaptureStatus
+        if session.status != CaptureStatus.STOPPED.value:
+            raise ValueError(
+                f"Cannot train baseline model on session '{req.session_id}' with status '{session.status}'. "
+                "Baseline training strictly requires a completed ('STOPPED') session."
+            )
+
         # 2. Retrieve flows for this baseline session
         flows = list(
             db.query(FlowRecord)
@@ -61,34 +86,51 @@ class DetectionService:
             .all()
         )
 
-        # 3. Train model pipeline
-        train_result = model_manager.train_baseline(
-            session_id=req.session_id,
-            flows=flows,
-            model_name=req.model_name or "IsolationForest_Baseline",
-            min_samples=req.min_samples,
-            contamination=req.contamination,
-            n_estimators=req.n_estimators,
-        )
+        previous_active_model_id = model_manager.active_model_info.get("model_id")
 
-        # 4. Save model registry record in DB
-        model_obj = ModelRegistry(
-            id=train_result["id"],
-            name=train_result["name"],
-            version=train_result["version"],
-            algorithm=train_result["algorithm"],
-            status=train_result["status"],
-            feature_names=train_result["feature_names"],
-            feature_schema_version=train_result["feature_schema_version"],
-            training_session_id=train_result["training_session_id"],
-            training_sample_count=train_result["training_sample_count"],
-            training_params=train_result["training_params"],
-            artifact_path=train_result["artifact_path"],
-            artifact_checksum=train_result["artifact_checksum"],
-            evaluation_info=train_result["evaluation_info"],
-        )
-        saved = DetectionRepository.create_model(db=db, model_obj=model_obj)
-        return ModelRegistryResponse.model_validate(saved)
+        try:
+            # 3. Train model pipeline
+            train_result = model_manager.train_baseline(
+                session_id=req.session_id,
+                flows=flows,
+                model_name=req.model_name or "IsolationForest_Baseline",
+                min_samples=req.min_samples,
+                contamination=req.contamination,
+                n_estimators=req.n_estimators,
+            )
+
+            # 4. Save model registry record in DB
+            model_obj = ModelRegistry(
+                id=train_result["id"],
+                name=train_result["name"],
+                version=train_result["version"],
+                algorithm=train_result["algorithm"],
+                status=train_result["status"],
+                feature_names=train_result["feature_names"],
+                feature_schema_version=train_result["feature_schema_version"],
+                training_session_id=train_result["training_session_id"],
+                training_sample_count=train_result["training_sample_count"],
+                training_params=train_result["training_params"],
+                artifact_path=train_result["artifact_path"],
+                artifact_checksum=train_result["artifact_checksum"],
+                evaluation_info=train_result["evaluation_info"],
+            )
+            saved = DetectionRepository.create_model(db=db, model_obj=model_obj)
+
+            # 5. Activate only after the registry transaction succeeds.
+            model_manager.activate_model(
+                model_id=saved.id,
+                version=saved.version,
+                pipeline=train_result["_pipeline"],
+            )
+            return ModelRegistryResponse.model_validate(saved)
+        except Exception:
+            logger.warning(
+                "Baseline model registration failed; restoring the previous active model state.",
+                exc_info=True,
+            )
+            DetectionService._restore_previous_active_model(db=db, previous_model_id=previous_active_model_id)
+            raise
 
     @staticmethod
     def get_model_status(db: Session) -> ModelStatusResponse:
@@ -155,7 +197,7 @@ class DetectionService:
         active_model_id = model_info.get("model_id")
         active_version = model_info.get("version")
 
-        # 3. Retrieve historical context for multi-flow rules
+        # 3. Retrieve historical context for multi-flow rules (strictly bounded, no cross-session leakage, no self-inclusion)
         flow_history: List[FlowRecord] = []
         if flow.src_ip:
             flow_time = flow.last_seen
@@ -163,7 +205,13 @@ class DetectionService:
                 flow_time = flow_time.replace(tzinfo=timezone.utc)
             cutoff = flow_time - timedelta(seconds=120)
             flow_history = DetectionRepository.get_recent_flows_for_src_ip(
-                db=db, src_ip=flow.src_ip, cutoff_time=cutoff, limit=50
+                db=db,
+                src_ip=flow.src_ip,
+                session_id=flow.session_id,
+                cutoff_time=cutoff,
+                upper_time=flow.window_start,
+                exclude_flow_id=flow.id,
+                limit=50,
             )
 
         # 4. Evaluate Rule Engine
@@ -239,6 +287,20 @@ class DetectionService:
             skip=skip,
             limit=limit,
         )
+
+    @staticmethod
+    def update_alert_status(
+        db: Session,
+        alert_id: uuid.UUID,
+        target_status: str,
+        notes: Optional[str] = None,
+    ) -> Optional[AlertResponse]:
+        alert = AlertService.update_alert_status(
+            db=db, alert_id=alert_id, target_status=target_status, notes=notes
+        )
+        if not alert:
+            return None
+        return AlertResponse.model_validate(alert)
 
     @staticmethod
     def resolve_alert(db: Session, alert_id: uuid.UUID) -> Optional[AlertResponse]:

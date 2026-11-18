@@ -243,8 +243,81 @@ def main():
             assert resolved.resolved_at is not None
             logger.info(f"Alert {resolved.id} successfully resolved at {resolved.resolved_at.isoformat()}.")
 
+        # 9. Outbox & DetectionWorker asynchronous processing test
+        import time
+        from app.services.detection_worker import detection_worker
+        from app.repositories.flow_repository import FlowRepository
+        from app.models.detection import DetectionJob, DetectionJobStatus
+
+        logger.info("Testing transactional outbox and background DetectionWorker on PostgreSQL...")
+        worker_flow = FlowRecord(
+            id=uuid.uuid4(),
+            session_id=baseline_session_id,
+            window_start=now,
+            window_end=now + timedelta(seconds=10),
+            flow_key="TCP:10.0.0.99:60000<->142.250.190.46:443",
+            src_ip="10.0.0.99",
+            dst_ip="142.250.190.46",
+            src_port=60000,
+            dst_port=443,
+            protocol="TCP",
+            protocol_num=6,
+            first_seen=now,
+            last_seen=now + timedelta(seconds=2),
+            duration_seconds=2.0,
+            packet_count=15,
+            byte_count=1800,
+            fwd_packets=8,
+            rev_packets=7,
+            fwd_bytes=900,
+            rev_bytes=900,
+            packets_per_second=7.5,
+            bytes_per_second=900.0,
+            min_packet_size=60,
+            max_packet_size=1200,
+            avg_packet_size=120.0,
+            tcp_syn_count=1,
+            tcp_ack_count=14,
+            tcp_fin_count=0,
+            tcp_rst_count=0,
+            tcp_psh_count=1,
+            dns_query_count=0,
+            dns_unique_query_count=0,
+            upload_bytes=900,
+            download_bytes=900,
+            upload_ratio=0.5,
+            is_local=True,
+            is_broadcast=False,
+            is_multicast=False,
+            features={},
+            feature_schema_version="1.0",
+        )
+        FlowRepository.create_batch(db, [worker_flow], create_jobs=True)
+        job = db.query(DetectionJob).filter(DetectionJob.flow_id == worker_flow.id).one()
+        assert job.status == DetectionJobStatus.PENDING.value
+        logger.info(f"Outbox job created: id={job.id}, status={job.status}")
+
+        # Start DetectionWorker and wait for processing
+        detection_worker.start()
+        time.sleep(2.0)
+        detection_worker.stop(timeout=5.0)
+
+        db.refresh(job)
+        logger.info(f"DetectionWorker finished job: id={job.id}, status={job.status}")
+        assert job.status == DetectionJobStatus.COMPLETED.value
+
+        # 10. Dashboard summary endpoint check
+        from app.services.flow_service import FlowService
+        dash = FlowService.get_dashboard_summary(db=db)
+        logger.info(
+            f"Dashboard summary: sessions={dash.total_sessions}, flows={dash.total_flows}, "
+            f"open_alerts={dash.alert_summary.total_open}, top_talkers={len(dash.top_talkers)}"
+        )
+        assert dash.total_flows > 0
+        assert len(dash.top_talkers) > 0
+
         logger.info("=" * 75)
-        logger.info("SUCCESS: Module 3 ML detection, rule engine, and alerts fully verified!")
+        logger.info("SUCCESS: Full backend integration (ML, Rules, Alerts, Outbox, Worker) verified!")
         logger.info("=" * 75)
 
     finally:

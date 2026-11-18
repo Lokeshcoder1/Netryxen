@@ -58,7 +58,9 @@ class AlertSeverity(str, enum.Enum):
 
 class AlertStatus(str, enum.Enum):
     OPEN = "OPEN"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
     RESOLVED = "RESOLVED"
+    FALSE_POSITIVE = "FALSE_POSITIVE"
 
 
 class DetectionJobStatus(str, enum.Enum):

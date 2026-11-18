@@ -17,6 +17,8 @@ from app.ml.model_manager import ModelManager, model_manager
 from app.models.capture_session import CaptureSession, CaptureStatus, SessionMode
 from app.models.detection import ModelStatus, PredictionStatus
 from app.models.flow_record import FlowRecord
+from app.schemas.detection import TrainBaselineRequest
+from app.services.detection_service import DetectionService
 
 
 def make_dummy_flow(
@@ -167,6 +169,41 @@ def test_model_fit_save_and_reload():
                 artifact_path=res["artifact_path"],
                 expected_checksum="invalid_checksum_hash_0000000000",
             )
+
+
+def test_service_train_baseline_activates_after_db_registration(db_session: Session):
+    model_manager.reset()
+    sess_id = uuid.uuid4()
+    session = CaptureSession(
+        id=sess_id,
+        interface_id="Test-Iface",
+        session_mode=SessionMode.BASELINE.value,
+        status=CaptureStatus.STOPPED.value,
+        started_at=datetime.now(timezone.utc),
+        stopped_at=datetime.now(timezone.utc),
+        packets_seen=80,
+        packets_enqueued=80,
+        packets_dropped=0,
+    )
+    db_session.add(session)
+
+    flows = []
+    for i in range(60):
+        flow = make_dummy_flow(packet_count=10 + (i % 3), byte_count=1000 + i * 25)
+        flow.session_id = sess_id
+        flows.append(flow)
+    db_session.add_all(flows)
+    db_session.commit()
+
+    saved = DetectionService.train_baseline(
+        db=db_session,
+        req=TrainBaselineRequest(session_id=sess_id, model_name="Service_Activation_Model", min_samples=50),
+    )
+
+    assert saved.status == ModelStatus.READY.value
+    assert model_manager.is_model_ready
+    assert model_manager.active_model_info["model_id"] == saved.id
+    assert saved.feature_schema_version == "1.0"
 
 
 def test_inference_predictions_on_normal_and_anomalous():
