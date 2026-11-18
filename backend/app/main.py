@@ -27,18 +27,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
     # Shutdown logic
     logger.info("Application shutting down...")
-    if detection_worker.is_running:
-        logger.info("Stopping background DetectionWorker on shutdown...")
-        try:
-            detection_worker.stop()
-        except Exception as exc:
-            logger.warning(f"Error during shutdown detection worker termination: {exc}")
     if capture_manager.is_running:
         logger.info("Stopping active capture engine on shutdown...")
         try:
             capture_manager.stop_capture()
         except Exception as exc:
             logger.warning(f"Error during shutdown capture termination: {exc}")
+    if detection_worker.is_running:
+        logger.info("Stopping background DetectionWorker on shutdown...")
+        try:
+            detection_worker.stop()
+        except Exception as exc:
+            logger.warning(f"Error during shutdown detection worker termination: {exc}")
     logger.info("Shutdown cleanup complete.")
 
 

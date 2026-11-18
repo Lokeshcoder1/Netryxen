@@ -112,6 +112,16 @@ class ModelManager:
             raise ValueError(
                 f"Invalid feature matrix dimensions {X.shape}. Expected (N, {len(FEATURE_NAMES)})."
             )
+        entirely_missing = [
+            FEATURE_NAMES[index]
+            for index in range(X.shape[1])
+            if np.all(~np.isfinite(X[:, index]))
+        ]
+        if entirely_missing:
+            raise ValueError(
+                "Cannot train baseline: required features are entirely missing: "
+                + ", ".join(entirely_missing)
+            )
 
         v_str = model_version or f"v{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
         contam = (
@@ -135,7 +145,7 @@ class ModelManager:
         # and is scale-invariant, RobustScaler and SimpleImputer ensure clean normalization
         # and guard against NaN/inf inputs during production inference.
         pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
+            ("imputer", SimpleImputer(strategy="median", keep_empty_features=False)),
             ("scaler", RobustScaler()),
             (
                 "model",
@@ -198,10 +208,6 @@ class ModelManager:
             "min_samples": required_samples,
         }
 
-        # Activate the newly trained model only after the artifact exists on disk and is valid.
-        # DetectionService remains responsible for rolling back if the DB registry transaction fails.
-        self.activate_model(model_id=model_id, version=v_str, pipeline=pipeline)
-
         return {
             "id": model_id,
             "name": model_name,
@@ -221,6 +227,17 @@ class ModelManager:
 
     def activate_model(self, model_id: uuid.UUID, version: str, pipeline: Pipeline) -> None:
         """Sets the active loaded model in memory."""
+        if not isinstance(pipeline, Pipeline):
+            raise TypeError("Candidate is not a valid scikit-learn Pipeline")
+        imputer = pipeline.named_steps.get("imputer")
+        model = pipeline.named_steps.get("model")
+        if imputer is None or model is None:
+            raise ValueError("Candidate pipeline lacks required imputer or model steps")
+        n_features = getattr(imputer, "n_features_in_", None)
+        if n_features is not None and int(n_features) != len(FEATURE_NAMES):
+            raise ValueError(
+                f"Candidate feature dimension mismatch: got {n_features}, expected {len(FEATURE_NAMES)}"
+            )
         with self._lock:
             self._active_model_id = model_id
             self._active_model_version = version
@@ -258,6 +275,12 @@ class ModelManager:
             step_names = [name for name, _ in loaded_obj.steps]
             if "model" not in step_names:
                 raise ValueError(f"Pipeline artifact at {path} lacks estimator step 'model'. Found steps: {step_names}")
+            imputer = loaded_obj.named_steps.get("imputer")
+            n_features = getattr(imputer, "n_features_in_", None)
+            if n_features is not None and int(n_features) != len(FEATURE_NAMES):
+                raise ValueError(
+                    f"Artifact feature dimension mismatch: got {n_features}, expected {len(FEATURE_NAMES)}"
+                )
 
         with self._lock:
             self._active_pipeline = loaded_obj

@@ -290,6 +290,7 @@ class FlowAggregator:
 
         # In-memory accumulators: key is (canonical_flow_key, window_start)
         self._accumulators: Dict[Tuple[str, datetime], FlowAccumulator] = {}
+        self._inflight_windows: Set[Tuple[str, datetime]] = set()
         # Bounded cache of recently finalized window keys to drop late arriving packets and prevent duplicate DB records
         self._finalized_windows: OrderedDict[Tuple[str, datetime], None] = OrderedDict()
         self._max_finalized_history: int = 50000
@@ -303,6 +304,7 @@ class FlowAggregator:
         self._total_flows_persisted: int = 0
         self._aggregation_errors: int = 0
         self._late_packets_dropped: int = 0
+        self._dropped_packets: int = 0
 
     @property
     def is_running(self) -> bool:
@@ -332,10 +334,12 @@ class FlowAggregator:
             self._packet_queue = packet_queue
             self._local_ips = set(local_ips or [])
             self._accumulators.clear()
+            self._inflight_windows.clear()
             self._finalized_windows.clear()
             self._total_flows_persisted = 0
             self._aggregation_errors = 0
             self._late_packets_dropped = 0
+            self._dropped_packets = 0
             self._is_running = True
 
             self._worker_thread = threading.Thread(
@@ -355,18 +359,26 @@ class FlowAggregator:
         Returns the total number of flow records persisted.
         """
         with self._lock:
-            if not self._is_running:
-                return 0
             self._is_running = False
 
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=10.0)
+        thread_terminated = not (
+            self._worker_thread and self._worker_thread.is_alive()
+        )
+        if not thread_terminated:
+            raise RuntimeError("FlowAggregator worker did not terminate within the shutdown timeout")
 
         # Drain any remaining packets from queue
         self._drain_remaining_packets()
 
         # Flush all active partial windows
         flushed_count = self._finalize_windows(force_all=True)
+        with self._lock:
+            if self._accumulators or self._inflight_windows:
+                raise RuntimeError(
+                    "FlowAggregator could not persist all flow windows; retained in-memory state for retry"
+                )
 
         with self._lock:
             self._active_session_id = None
@@ -378,9 +390,6 @@ class FlowAggregator:
         return total
 
     def _process_packet(self, packet: PacketEventSchema) -> None:
-        if not self._active_session_id:
-            return
-
         flow_key = generate_canonical_flow_key(
             src_ip=packet.src_ip,
             dst_ip=packet.dst_ip,
@@ -397,28 +406,45 @@ class FlowAggregator:
 
         acc_key = (flow_key, window_start)
 
-        # Late packet policy: If the window for this packet was already finalized and persisted to DB,
-        # drop it rather than resurrecting a duplicate flow record for the same window.
-        if acc_key in self._finalized_windows:
-            self._late_packets_dropped += 1
-            return
+        with self._lock:
+            if not self._active_session_id:
+                return
+            if acc_key in self._finalized_windows or acc_key in self._inflight_windows:
+                self._late_packets_dropped += 1
+                return
+            accumulator = self._accumulators.get(acc_key)
+            if accumulator:
+                accumulator.add_packet(packet)
+                return
+            at_capacity = len(self._accumulators) >= self.max_in_memory_flows
 
-        # Check bounds before adding new flows
-        if acc_key not in self._accumulators and len(self._accumulators) >= self.max_in_memory_flows:
-            logger.warning("FlowAggregator in-memory capacity reached. Forcing early finalization of oldest windows.")
-            self._finalize_windows(force_oldest=True)
+        if at_capacity:
+            self._finalize_windows()
 
-        if acc_key in self._accumulators:
-            self._accumulators[acc_key].add_packet(packet)
-        else:
-            self._accumulators[acc_key] = FlowAccumulator(
-                session_id=self._active_session_id,
-                flow_key=flow_key,
-                window_start=window_start,
-                window_end=window_end,
-                first_packet=packet,
-                local_ips=self._local_ips,
-            )
+        with self._lock:
+            if not self._active_session_id:
+                return
+            if acc_key in self._finalized_windows or acc_key in self._inflight_windows:
+                self._late_packets_dropped += 1
+                return
+            accumulator = self._accumulators.get(acc_key)
+            if accumulator:
+                accumulator.add_packet(packet)
+            elif len(self._accumulators) >= self.max_in_memory_flows:
+                self._dropped_packets += 1
+                logger.warning(
+                    "FlowAggregator memory capacity exhausted; dropping packet for active flow "
+                    "because no logical window is eligible for finalization"
+                )
+            else:
+                self._accumulators[acc_key] = FlowAccumulator(
+                    session_id=self._active_session_id,
+                    flow_key=flow_key,
+                    window_start=window_start,
+                    window_end=window_end,
+                    first_packet=packet,
+                    local_ips=self._local_ips,
+                )
 
     def _drain_remaining_packets(self) -> None:
         """
@@ -442,7 +468,7 @@ class FlowAggregator:
         if count > 0:
             logger.debug(f"FlowAggregator drained {count} remaining packets from queue")
 
-    def _finalize_windows(self, force_all: bool = False, force_oldest: bool = False) -> int:
+    def _finalize_windows(self, force_all: bool = False) -> int:
         """
         Extracts eligible or expired flow windows, converts them to FlowRecord models,
         and persists them into PostgreSQL in batches.
@@ -450,51 +476,48 @@ class FlowAggregator:
         now = datetime.now(timezone.utc)
         grace_period = timedelta(seconds=2)  # allow slightly delayed packets to enter current window
 
-        keys_to_finalize: List[Tuple[str, datetime]] = []
-
-        if force_all:
-            keys_to_finalize = list(self._accumulators.keys())
-        elif force_oldest:
-            # Sort windows by start time and finalize the oldest half
-            sorted_keys = sorted(self._accumulators.keys(), key=lambda k: k[1])
-            keys_to_finalize = sorted_keys[: max(1, len(sorted_keys) // 2)]
-        else:
-            for (key, w_start), acc in self._accumulators.items():
-                if acc.window_end + grace_period <= now:
-                    keys_to_finalize.append((key, w_start))
-
-        if not keys_to_finalize:
-            return 0
-
         records: List[FlowRecord] = []
-        for k in keys_to_finalize:
-            acc = self._accumulators.pop(k, None)
-            if acc:
-                records.append(acc.to_flow_record())
-                self._finalized_windows[k] = None
-                if len(self._finalized_windows) > self._max_finalized_history:
-                    self._finalized_windows.popitem(last=False)
+        snapshot: Dict[Tuple[str, datetime], FlowAccumulator] = {}
+        with self._lock:
+            keys_to_finalize = [
+                key for key, accumulator in self._accumulators.items()
+                if force_all or accumulator.window_end + grace_period <= now
+            ]
+            for k in keys_to_finalize:
+                acc = self._accumulators.pop(k, None)
+                if acc:
+                    self._inflight_windows.add(k)
+                    snapshot[k] = acc
+                    records.append(acc.to_flow_record())
 
         if not records:
             return 0
 
-        # Persist to PostgreSQL
         try:
             from app.repositories.flow_repository import FlowRepository
             db = self._get_db_session()
             try:
-                FlowRepository.create_batch(db, records)
+                persisted_count = FlowRepository.create_batch(db, records)
                 with self._lock:
-                    self._total_flows_persisted += len(records)
-                logger.info(f"Persisted {len(records)} flow records to database")
+                    for k in snapshot:
+                        self._inflight_windows.discard(k)
+                        self._finalized_windows[k] = None
+                    while len(self._finalized_windows) > self._max_finalized_history:
+                        self._finalized_windows.popitem(last=False)
+                    self._total_flows_persisted += persisted_count
+                logger.info(f"Persisted {persisted_count} flow records to database")
             finally:
                 db.close()
         except Exception as exc:
             with self._lock:
+                for k, acc in snapshot.items():
+                    self._inflight_windows.discard(k)
+                    self._accumulators.setdefault(k, acc)
                 self._aggregation_errors += 1
             logger.error(f"Error persisting {len(records)} flow records to database: {exc}")
 
-        return len(records)
+        with self._lock:
+            return sum(1 for key in snapshot if key in self._finalized_windows)
 
     def _worker_loop(self) -> None:
         """
@@ -545,6 +568,7 @@ class FlowAggregator:
                 "total_flows_persisted": self._total_flows_persisted,
                 "aggregation_errors": self._aggregation_errors,
                 "late_packets_dropped": self._late_packets_dropped,
+                "dropped_packets": self._dropped_packets,
             }
 
 

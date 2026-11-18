@@ -46,6 +46,15 @@ def setup_test_db():
     Base.metadata.drop_all(bind=test_engine)
 
 
+@pytest.fixture(autouse=True)
+def clear_in_memory_sqlite_database():
+    if TEST_DATABASE_URL != "sqlite:///:memory:":
+        return
+    with test_engine.begin() as connection:
+        for table in reversed(Base.metadata.sorted_tables):
+            connection.execute(table.delete())
+
+
 @pytest.fixture
 def db_session() -> Generator[Session, None, None]:
     connection = test_engine.connect()

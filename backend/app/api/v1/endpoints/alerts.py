@@ -47,6 +47,7 @@ def resolve_alert(
     db: Session = Depends(get_db),
 ) -> AlertResponse:
     alert = DetectionService.resolve_alert(db=db, alert_id=alert_id)
+    db.commit()
     if not alert:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -73,6 +74,7 @@ def update_alert_status(
             target_status=req.status,
             notes=req.notes,
         )
+        db.commit()
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

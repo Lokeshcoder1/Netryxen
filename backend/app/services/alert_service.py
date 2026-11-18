@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy import and_, desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -207,79 +208,93 @@ class AlertService:
         If found within the cooldown period, increments occurrence count and updates last_seen.
         Otherwise creates a new alert record.
         """
-        cooldown_cutoff = now - timedelta(seconds=cooldown_seconds)
-
-        with _alert_lock:
-            stmt = (
-                select(Alert)
-                .where(
-                    and_(
-                        Alert.fingerprint == fingerprint,
-                        Alert.status == AlertStatus.OPEN.value,
-                        Alert.last_seen >= cooldown_cutoff,
-                    )
+        stmt = (
+            select(Alert)
+            .where(
+                and_(
+                    Alert.fingerprint == fingerprint,
+                    Alert.status.in_([AlertStatus.OPEN.value, AlertStatus.ACKNOWLEDGED.value]),
                 )
-                .order_by(desc(Alert.last_seen))
-                .limit(1)
             )
-            existing = db.execute(stmt).scalar_one_or_none()
+            .order_by(desc(Alert.last_seen))
+            .limit(1)
+            .with_for_update()
+        )
+        existing = db.execute(stmt).scalar_one_or_none()
 
-            if existing:
-                existing.occurrence_count += 1
-                existing.last_seen = now
-                # Update flow reference to most recent occurrence
-                existing.flow_id = getattr(flow, "id", existing.flow_id)
+        if existing:
+            existing.occurrence_count += 1
+            existing.last_seen = now
+            existing.flow_id = getattr(flow, "id", existing.flow_id)
 
-                # Merge rule evidence dictionary
-                merged_evidence = dict(existing.rule_evidence or {})
-                merged_evidence.update(evidence)
-                existing.rule_evidence = merged_evidence
+            merged_evidence = dict(existing.rule_evidence or {})
+            merged_evidence.update(evidence)
+            existing.rule_evidence = merged_evidence
+            existing.model_version = model_version or existing.model_version
+            if source == DetectionSource.COMBINED.value:
+                existing.detection_source = source
 
-                # Severity elevation policy: elevate if incoming severity is strictly higher, NEVER downgrade
-                existing_rank = SEVERITY_ORDER.get(existing.severity, 1)
-                new_rank = SEVERITY_ORDER.get(severity, 1)
-                if new_rank > existing_rank:
-                    logger.info(
-                        f"Elevating alert '{fingerprint}' severity from {existing.severity} to {severity}"
-                    )
-                    existing.severity = severity
-                    existing.title = title
-                    existing.description = description
-                    existing.detection_source = source
-
-                db.commit()
-                db.refresh(existing)
+            existing_rank = SEVERITY_ORDER.get(existing.severity, 1)
+            new_rank = SEVERITY_ORDER.get(severity, 1)
+            if new_rank > existing_rank:
                 logger.info(
-                    f"Deduplicated alert '{fingerprint}': occurrence count updated to {existing.occurrence_count} (severity={existing.severity})"
+                    f"Elevating alert '{fingerprint}' severity from {existing.severity} to {severity}"
                 )
-                return existing
+                existing.severity = severity
+                existing.title = title
+                existing.description = description
+                existing.detection_source = source
 
-            # Create new alert
-            new_alert = Alert(
-                id=uuid.uuid4(),
-                flow_id=getattr(flow, "id", None),
-                session_id=getattr(flow, "session_id", None),
-                detection_source=source,
-                model_version=model_version,
-                rule_id=rule_id,
-                rule_evidence=evidence,
-                severity=severity,
-                title=title,
-                description=description,
-                fingerprint=fingerprint,
-                occurrence_count=1,
-                first_seen=now,
-                last_seen=now,
-                status=AlertStatus.OPEN.value,
-                resolved_at=None,
-            )
-            db.add(new_alert)
-            db.commit()
-            db.refresh(new_alert)
             logger.info(
-                f"Created new {severity} alert: '{title}' (source={source}, id={new_alert.id})"
+                f"Deduplicated alert '{fingerprint}': occurrence count updated to {existing.occurrence_count} (severity={existing.severity})"
             )
-            return new_alert
+            return existing
+
+        # Create new alert
+        new_alert = Alert(
+            id=uuid.uuid4(),
+            flow_id=getattr(flow, "id", None),
+            session_id=getattr(flow, "session_id", None),
+            detection_source=source,
+            model_version=model_version,
+            rule_id=rule_id,
+            rule_evidence=evidence,
+            severity=severity,
+            title=title,
+            description=description,
+            fingerprint=fingerprint,
+            occurrence_count=1,
+            first_seen=now,
+            last_seen=now,
+            status=AlertStatus.OPEN.value,
+            resolved_at=None,
+        )
+        try:
+            with db.begin_nested():
+                db.add(new_alert)
+                db.flush()
+        except IntegrityError:
+            existing = db.execute(stmt).scalar_one_or_none()
+            if existing:
+                return AlertService._deduplicate_or_create(
+                    db=db,
+                    flow=flow,
+                    source=source,
+                    model_version=model_version,
+                    rule_id=rule_id,
+                    evidence=evidence,
+                    severity=severity,
+                    title=title,
+                    description=description,
+                    fingerprint=fingerprint,
+                    cooldown_seconds=cooldown_seconds,
+                    now=now,
+                )
+            raise
+        logger.info(
+            f"Created new {severity} alert: '{title}' (source={source}, id={new_alert.id})"
+        )
+        return new_alert
 
     @staticmethod
     def update_alert_status(
@@ -302,27 +317,25 @@ class AlertService:
                 f"Invalid alert status '{target_status}'. Must be one of: {sorted(list(valid_statuses))}"
             )
 
-        with _alert_lock:
-            stmt = select(Alert).where(Alert.id == alert_id)
-            alert = db.execute(stmt).scalar_one_or_none()
-            if not alert:
-                return None
+        stmt = select(Alert).where(Alert.id == alert_id)
+        alert = db.execute(stmt).scalar_one_or_none()
+        if not alert:
+            return None
 
-            alert.status = status_upper
-            if status_upper in (AlertStatus.RESOLVED.value, AlertStatus.FALSE_POSITIVE.value):
-                alert.resolved_at = datetime.now(timezone.utc)
-            else:
-                alert.resolved_at = None
+        alert.status = status_upper
+        if status_upper in (AlertStatus.RESOLVED.value, AlertStatus.FALSE_POSITIVE.value):
+            alert.resolved_at = datetime.now(timezone.utc)
+        else:
+            alert.resolved_at = None
 
-            if notes:
-                ev = dict(alert.rule_evidence or {})
-                ev["analyst_notes"] = notes
-                alert.rule_evidence = ev
+        if notes:
+            ev = dict(alert.rule_evidence or {})
+            ev["analyst_notes"] = notes
+            alert.rule_evidence = ev
 
-            db.commit()
-            db.refresh(alert)
-            logger.info(f"Updated alert {alert_id} status to {status_upper}")
-            return alert
+        db.flush()
+        logger.info(f"Updated alert {alert_id} status to {status_upper}")
+        return alert
 
     @staticmethod
     def resolve_alert(db: Session, alert_id: uuid.UUID, notes: Optional[str] = None) -> Optional[Alert]:

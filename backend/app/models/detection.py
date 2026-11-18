@@ -17,6 +17,8 @@ from sqlalchemy import (
     JSON,
     String,
     Text,
+    UniqueConstraint,
+    text,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -181,6 +183,7 @@ class Prediction(Base):
 
     __table_args__ = (
         Index("ix_predictions_flow_model", "flow_id", "model_id"),
+        UniqueConstraint("flow_id", name="uq_predictions_flow"),
     )
 
     def __repr__(self) -> str:
@@ -261,6 +264,13 @@ class Alert(Base):
 
     __table_args__ = (
         Index("ix_alerts_fingerprint_status", "fingerprint", "status"),
+        Index(
+            "uq_alerts_active_fingerprint",
+            "fingerprint",
+            unique=True,
+            postgresql_where=text("status IN ('OPEN', 'ACKNOWLEDGED')"),
+            sqlite_where=text("status IN ('OPEN', 'ACKNOWLEDGED')"),
+        ),
     )
 
     def __repr__(self) -> str:
@@ -303,6 +313,9 @@ class DetectionJob(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    worker_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )

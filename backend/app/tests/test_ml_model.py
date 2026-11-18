@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import uuid
@@ -150,7 +150,7 @@ def test_model_fit_save_and_reload():
         assert res["status"] == ModelStatus.READY.value
         assert os.path.exists(res["artifact_path"])
         assert res["artifact_checksum"] is not None
-        assert mgr.is_model_ready
+        assert not mgr.is_model_ready
 
         # Test reload in fresh manager
         mgr2 = ModelManager(artifacts_dir=tmp_dir)
@@ -191,6 +191,7 @@ def test_service_train_baseline_activates_after_db_registration(db_session: Sess
     for i in range(60):
         flow = make_dummy_flow(packet_count=10 + (i % 3), byte_count=1000 + i * 25)
         flow.session_id = sess_id
+        flow.window_start = flow.window_start + timedelta(seconds=i)
         flows.append(flow)
     db_session.add_all(flows)
     db_session.commit()
@@ -219,12 +220,17 @@ def test_inference_predictions_on_normal_and_anomalous():
             )
             for i in range(60)
         ]
-        mgr.train_baseline(
+        result = mgr.train_baseline(
             session_id=uuid.uuid4(),
             flows=flows,
             min_samples=50,
             n_estimators=100,
             contamination=0.05,
+        )
+        mgr.activate_model(
+            model_id=result["id"],
+            version=result["version"],
+            pipeline=result["_pipeline"],
         )
 
         # 1. Normal flow matching baseline

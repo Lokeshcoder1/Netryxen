@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy import and_, desc, func, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.models.detection import (
@@ -63,9 +65,49 @@ class DetectionRepository:
 
     @staticmethod
     def create_prediction(db: Session, pred_obj: Prediction) -> Prediction:
+        dialect = db.bind.dialect.name if db.bind else ""
+        if dialect in {"postgresql", "sqlite"}:
+            insert_fn = postgresql_insert if dialect == "postgresql" else sqlite_insert
+            statement = (
+                insert_fn(Prediction)
+                .values(
+                    id=pred_obj.id,
+                    flow_id=pred_obj.flow_id,
+                    model_id=pred_obj.model_id,
+                    model_version=pred_obj.model_version,
+                    status=pred_obj.status,
+                    raw_score=pred_obj.raw_score,
+                    raw_prediction=pred_obj.raw_prediction,
+                )
+                .on_conflict_do_update(
+                    index_elements=["flow_id"],
+                    set_={
+                        "model_id": pred_obj.model_id,
+                        "model_version": pred_obj.model_version,
+                        "status": pred_obj.status,
+                        "raw_score": pred_obj.raw_score,
+                        "raw_prediction": pred_obj.raw_prediction,
+                    },
+                )
+                .returning(Prediction.id)
+            )
+            prediction_id = db.execute(statement).scalar_one()
+            return db.execute(
+                select(Prediction).where(Prediction.id == prediction_id)
+            ).scalar_one()
+        existing = db.execute(
+            select(Prediction).where(Prediction.flow_id == pred_obj.flow_id)
+        ).scalar_one_or_none()
+        if existing:
+            existing.model_id = pred_obj.model_id
+            existing.model_version = pred_obj.model_version
+            existing.status = pred_obj.status
+            existing.raw_score = pred_obj.raw_score
+            existing.raw_prediction = pred_obj.raw_prediction
+            db.flush()
+            return existing
         db.add(pred_obj)
-        db.commit()
-        db.refresh(pred_obj)
+        db.flush()
         return pred_obj
 
     @staticmethod
