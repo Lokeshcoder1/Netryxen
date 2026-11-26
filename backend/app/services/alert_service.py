@@ -204,18 +204,23 @@ class AlertService:
         now: datetime,
     ) -> Alert:
         """
-        Looks for an active OPEN alert with the same fingerprint.
-        If found within the cooldown period, increments occurrence count and updates last_seen.
+        Looks for an active alert with the same fingerprint in the same capture session.
+        If found, increments occurrence count and updates last_seen.
         Otherwise creates a new alert record.
         """
+        session_id = getattr(flow, "session_id", None)
+        active_filters = [
+            Alert.fingerprint == fingerprint,
+            Alert.status.in_([AlertStatus.OPEN.value, AlertStatus.ACKNOWLEDGED.value]),
+        ]
+        if session_id is None:
+            active_filters.append(Alert.session_id.is_(None))
+        else:
+            active_filters.append(Alert.session_id == session_id)
+
         stmt = (
             select(Alert)
-            .where(
-                and_(
-                    Alert.fingerprint == fingerprint,
-                    Alert.status.in_([AlertStatus.OPEN.value, AlertStatus.ACKNOWLEDGED.value]),
-                )
-            )
+            .where(and_(*active_filters))
             .order_by(desc(Alert.last_seen))
             .limit(1)
             .with_for_update()
