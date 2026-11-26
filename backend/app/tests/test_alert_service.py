@@ -228,3 +228,67 @@ def test_alert_resolution(db_session: Session):
     assert resolved is not None
     assert resolved.status == AlertStatus.RESOLVED.value
     assert resolved.resolved_at is not None
+
+
+def test_alert_deduplication_is_scoped_to_capture_session(db_session: Session):
+    flow_a = make_test_flow(
+        src_ip="10.0.0.25",
+        dst_ip="198.51.100.40",
+        dst_port=443,
+    )
+    finding = RuleFinding(
+        rule_id="RULE_SESSION_SCOPE",
+        title="Session-scoped test",
+        description="Same fingerprint should be independent across sessions",
+        severity=AlertSeverity.MEDIUM,
+        evidence={"source": "test"},
+    )
+
+    first = AlertService.evaluate_and_alert(
+        db=db_session,
+        flow=flow_a,
+        ml_status=PredictionStatus.NORMAL,
+        ml_score=None,
+        model_version=None,
+        rule_findings=[finding],
+    )[0]
+
+    # Same endpoints and rule, but a different capture session: create a
+    # separate alert rather than merging investigation histories.
+    flow_b = make_test_flow(
+        src_ip="10.0.0.25",
+        dst_ip="198.51.100.40",
+        dst_port=443,
+    )
+    assert flow_b.session_id != flow_a.session_id
+    second = AlertService.evaluate_and_alert(
+        db=db_session,
+        flow=flow_b,
+        ml_status=PredictionStatus.NORMAL,
+        ml_score=None,
+        model_version=None,
+        rule_findings=[finding],
+    )[0]
+
+    assert second.id != first.id
+    assert db_session.query(Alert).count() == 2
+
+    # A further occurrence within flow_a's session must still deduplicate.
+    flow_a_repeat = make_test_flow(
+        src_ip="10.0.0.25",
+        dst_ip="198.51.100.40",
+        dst_port=443,
+    )
+    flow_a_repeat.session_id = flow_a.session_id
+    repeated = AlertService.evaluate_and_alert(
+        db=db_session,
+        flow=flow_a_repeat,
+        ml_status=PredictionStatus.NORMAL,
+        ml_score=None,
+        model_version=None,
+        rule_findings=[finding],
+    )[0]
+
+    assert repeated.id == first.id
+    assert repeated.occurrence_count == 2
+    assert db_session.query(Alert).count() == 2

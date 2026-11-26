@@ -264,12 +264,30 @@ class Alert(Base):
 
     __table_args__ = (
         Index("ix_alerts_fingerprint_status", "fingerprint", "status"),
+        # A fingerprint is unique within a capture session, not globally.
         Index(
-            "uq_alerts_active_fingerprint",
+            "uq_alerts_active_session_fingerprint",
+            "session_id",
             "fingerprint",
             unique=True,
-            postgresql_where=text("status IN ('OPEN', 'ACKNOWLEDGED')"),
-            sqlite_where=text("status IN ('OPEN', 'ACKNOWLEDGED')"),
+            postgresql_where=text(
+                "status IN ('OPEN', 'ACKNOWLEDGED') AND session_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('OPEN', 'ACKNOWLEDGED') AND session_id IS NOT NULL"
+            ),
+        ),
+        # NULL-session alerts share one global scope and also need race protection.
+        Index(
+            "uq_alerts_active_null_session_fingerprint",
+            "fingerprint",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('OPEN', 'ACKNOWLEDGED') AND session_id IS NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('OPEN', 'ACKNOWLEDGED') AND session_id IS NULL"
+            ),
         ),
     )
 
